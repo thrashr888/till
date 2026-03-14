@@ -1,0 +1,8 @@
+{
+  "name": "wellsfargo",
+  "display_name": "Wells Fargo",
+  "account_types": ["checking", "savings", "brokerage"],
+  "provides": ["accounts", "transactions", "balances"],
+  "requires_headful": true,
+  "config_schema": {}
+}

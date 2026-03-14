@@ -1,0 +1,8 @@
+{
+  "name": "amex",
+  "display_name": "American Express",
+  "account_types": ["credit"],
+  "provides": ["accounts", "transactions", "balances"],
+  "requires_headful": true,
+  "config_schema": {}
+}

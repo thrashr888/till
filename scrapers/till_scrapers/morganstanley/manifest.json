@@ -1,0 +1,14 @@
+{
+  "name": "morganstanley",
+  "display_name": "Morgan Stanley",
+  "account_types": ["brokerage", "ira", "401k"],
+  "provides": ["accounts", "positions", "balances"],
+  "requires_headful": true,
+  "config_schema": {
+    "variant": {
+      "type": "string",
+      "description": "Account variant: 'personal' or 'workplace' (StockPlan Connect)",
+      "default": "personal"
+    }
+  }
+}

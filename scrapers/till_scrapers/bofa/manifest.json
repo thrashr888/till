@@ -1,0 +1,8 @@
+{
+  "name": "bofa",
+  "display_name": "Bank of America",
+  "account_types": ["checking", "savings", "credit"],
+  "provides": ["accounts", "transactions", "balances"],
+  "requires_headful": true,
+  "config_schema": {}
+}

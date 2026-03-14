@@ -1,0 +1,8 @@
+{
+  "name": "fidelity",
+  "display_name": "Fidelity",
+  "account_types": ["brokerage", "ira", "401k", "hsa"],
+  "provides": ["accounts", "positions", "balances"],
+  "requires_headful": true,
+  "config_schema": {}
+}
