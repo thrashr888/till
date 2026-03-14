@@ -450,9 +450,16 @@ impl Database {
         let mut transactions_count = 0i64;
         let mut positions_count = 0i64;
 
+        // Build mapping from original account_id -> hashed id
+        let mut id_map = std::collections::HashMap::new();
+
         for acct_val in &envelope.accounts {
             let account = parse_account_from_json(acct_val, &envelope.source, &now);
             if let Some(a) = account {
+                // Map original account_id to the hashed one
+                if let Some(orig_id) = acct_val.get("account_id").and_then(|v| v.as_str()) {
+                    id_map.insert(orig_id.to_string(), a.id.clone());
+                }
                 self.upsert_account(&a)?;
                 self.insert_balance_snapshot(&BalanceSnapshot {
                     id: None,
@@ -467,7 +474,11 @@ impl Database {
 
         for txn_val in &envelope.transactions {
             let txn = parse_transaction_from_json(txn_val, &envelope.source);
-            if let Some(t) = txn {
+            if let Some(mut t) = txn {
+                // Remap account_id if needed
+                if let Some(mapped) = id_map.get(&t.account_id) {
+                    t.account_id = mapped.clone();
+                }
                 self.upsert_transaction(&t)?;
                 transactions_count += 1;
             }
@@ -475,7 +486,10 @@ impl Database {
 
         for pos_val in &envelope.positions {
             let pos = parse_position_from_json(pos_val, &envelope.source, &now);
-            if let Some(p) = pos {
+            if let Some(mut p) = pos {
+                if let Some(mapped) = id_map.get(&p.account_id) {
+                    p.account_id = mapped.clone();
+                }
                 self.upsert_position(&p)?;
                 positions_count += 1;
             }
