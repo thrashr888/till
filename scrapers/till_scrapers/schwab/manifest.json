@@ -1,0 +1,18 @@
+{
+  "name": "schwab",
+  "display_name": "Charles Schwab",
+  "account_types": ["brokerage", "checking", "savings", "ira", "401k", "hsa"],
+  "provides": ["accounts", "transactions", "positions", "balances"],
+  "requires_headful": true,
+  "config_schema": {
+    "transaction_account": {
+      "type": "string",
+      "description": "Account number suffix for transaction pulls"
+    },
+    "account_types": {
+      "type": "array",
+      "description": "Which account types to include",
+      "default": ["Bank", "Investment"]
+    }
+  }
+}

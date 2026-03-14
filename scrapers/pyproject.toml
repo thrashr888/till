@@ -1,0 +1,23 @@
+[project]
+name = "till-scrapers"
+version = "0.1.0"
+description = "Finance scraper plugins for till"
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.40",
+    "playwright-stealth>=1.0",
+    "tomli>=2.0",
+]
+
+[project.scripts]
+till-scrape = "till_scrapers.runner:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["till_scrapers"]
+
+[tool.uv]
+package = true

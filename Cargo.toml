@@ -1,0 +1,29 @@
+[package]
+name = "till-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Personal finance CLI — a self-hosted Plaid for Schwab, E*Trade, Chase, and more"
+license = "MIT"
+repository = "https://github.com/thrashr888/till"
+homepage = "https://github.com/thrashr888/till"
+readme = "README.md"
+keywords = ["finance", "cli", "scraper", "personal-finance"]
+categories = ["command-line-utilities"]
+rust-version = "1.70"
+
+[[bin]]
+name = "till"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+md-5 = "0.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+which = "6"

@@ -1,0 +1,13 @@
+{
+  "name": "chase",
+  "display_name": "Chase",
+  "account_types": ["credit", "checking", "savings"],
+  "provides": ["accounts", "transactions", "balances"],
+  "requires_headful": true,
+  "config_schema": {
+    "accounts": {
+      "type": "array",
+      "description": "List of accounts with name and last4 fields"
+    }
+  }
+}

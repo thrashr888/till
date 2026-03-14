@@ -1,0 +1,8 @@
+{
+  "name": "etrade",
+  "display_name": "E*Trade",
+  "account_types": ["brokerage", "ira", "401k"],
+  "provides": ["accounts", "positions", "balances"],
+  "requires_headful": false,
+  "config_schema": {}
+}
