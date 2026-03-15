@@ -34,8 +34,8 @@ class ChaseScraper(BaseScraper):
 
     # Known Chase API endpoints
     CARD_LIST_API = (
-        "https://secure.chase.com/svc/rr/accounts/secure/gateway/"
-        "card/list"
+        "https://secure.chase.com/svc/rr/accounts/secure/v2/"
+        "account/detail/card/list"
     )
     TXN_API_BASE = (
         "https://secure.chase.com/svc/rr/accounts/secure/gateway/"
@@ -366,7 +366,7 @@ class ChaseScraper(BaseScraper):
             account_results.append({
                 "account_id": acct["id"],
                 "account_name": acct["name"],
-                "account_type": "credit",
+                "account_type": acct.get("account_type", "credit"),
                 "balance": acct.get("balance", 0),
                 "available_credit": acct.get("available_credit"),
             })
@@ -628,51 +628,109 @@ class ChaseScraper(BaseScraper):
     # -- DOM extraction (fallback) ----------------------------------------
 
     async def _extract_accounts_dom(self, page) -> list[dict]:
-        """Extract credit card accounts from the dashboard via DOM/text parsing."""
+        """Extract credit card accounts from the dashboard via DOM/text parsing.
+
+        Chase uses web components (mds-button, mds-definition-link, etc.) so
+        standard element selectors won't find them.  We rely on data-testid
+        attributes and the ``text`` attribute of ``<mds-button>`` inside each
+        ``[data-testid="accountTile"]`` container.
+        """
         accounts = []
 
         try:
+            # Strategy 1: Use data-testid selectors (reliable against Chase's
+            # MDS web-component DOM).
             card_data = await page.evaluate(r'''() => {
                 const cards = [];
-                const allElements = document.querySelectorAll('a, button, span, h2, h3, h4, [role="heading"]');
-                for (const el of allElements) {
-                    const text = (el.textContent || "").trim();
-                    const match = text.match(/^(.+?)\s*\((?:\.{2,3}|\u2026)(\d{4})\)\s*$/);
+                const tiles = document.querySelectorAll('[data-testid="accountTile"]');
+                for (const tile of tiles) {
+                    // Card name & last4 from the mds-button inside the name link
+                    const nameBtn = tile.querySelector('[data-testid="accounts-name-link"] mds-button');
+                    if (!nameBtn) continue;
+                    const btnText = nameBtn.getAttribute('text') || '';
+                    const match = btnText.match(/^(.+?)\s*\((?:\.{2,3}|\u2026)(\d{4})\)\s*$/);
                     if (!match) continue;
                     const name = match[1].trim();
                     const lastFour = match[2];
-                    if (name.length < 3 || name.length > 50) continue;
 
-                    let section = null;
-                    let el2 = el;
-                    for (let i = 0; i < 12; i++) {
-                        el2 = el2.parentElement;
-                        if (!el2) break;
-                        const t = el2.innerText || "";
-                        if ((t.includes("Current balance") || t.includes("Available credit"))
-                            && t.length > 50) {
-                            section = el2;
+                    // Chase account ID from the button's data-testid or id
+                    // Pattern: accounts-name-link-button-{CHASE_ACCT_ID}
+                    const btnTestId = nameBtn.getAttribute('data-testid') || '';
+                    const idMatch = btnTestId.match(/accounts-name-link-button-(\d+)/);
+                    const chaseAcctId = idMatch ? idMatch[1] : '';
+
+                    // Balance: find the dataItem whose id contains "currentBalance" or
+                    // "amountDueFlyoutWithLink" (for loans)
+                    let balance = '';
+                    const balanceEl = tile.querySelector(
+                        '[id*="-currentBalance-dataItem"] [data-testid="dataItem-value"]'
+                    ) || tile.querySelector(
+                        '[id*="-amountDueFlyoutWithLink-dataItem"] [data-testid="dataItem-value"]'
+                    );
+                    if (balanceEl) balance = (balanceEl.textContent || '').trim();
+
+                    // Available credit
+                    let availCredit = '';
+                    const availEl = tile.querySelector(
+                        '[id*="-availableCredit-dataItem"] [data-testid="dataItem-value"]'
+                    );
+                    if (availEl) availCredit = (availEl.textContent || '').trim();
+
+                    // Detect account type from the group heading
+                    let accountGroup = '';
+                    let parent = tile;
+                    for (let i = 0; i < 8; i++) {
+                        parent = parent.parentElement;
+                        if (!parent) break;
+                        const heading = parent.querySelector('[data-testid="customAccordion-title"] [role="heading"]');
+                        if (heading) {
+                            accountGroup = (heading.textContent || '').trim();
                             break;
                         }
                     }
-                    if (!section) section = el.parentElement?.parentElement?.parentElement?.parentElement;
-                    const sectionText = section ? section.innerText : "";
+
                     cards.push({
                         name: name,
                         last_four: lastFour,
-                        text: sectionText.substring(0, 1500),
-                        href: el.href || el.closest('a')?.href || ""
+                        chase_acct_id: chaseAcctId,
+                        balance: balance,
+                        available_credit: availCredit,
+                        account_group: accountGroup,
                     });
                 }
+
+                // Strategy 2 fallback: mds-select-option in the transaction selector
+                if (cards.length === 0) {
+                    const options = document.querySelectorAll('mds-select-option[data-testid*="account_options_id"]');
+                    for (const opt of options) {
+                        const label = opt.getAttribute('label') || '';
+                        const match = label.match(/^(.+?)\s*\((?:\.{2,3}|\u2026)(\d{4})\)\s*$/);
+                        if (!match) continue;
+                        cards.push({
+                            name: match[1].trim(),
+                            last_four: match[2],
+                            chase_acct_id: '',
+                            balance: '',
+                            available_credit: '',
+                            account_group: '',
+                        });
+                    }
+                }
+
                 return cards;
             }''')
-
-            page_text = await page.inner_text('body')
 
             for card in (card_data or []):
                 last4 = card.get("last_four", "")
                 name = card.get("name", "Chase Card")
                 account_id = hashlib.md5(f"chase_{name}_{last4}".encode()).hexdigest()[:16]
+                account_group = card.get("account_group", "")
+
+                # Determine account type from the group heading
+                if "loan" in account_group.lower():
+                    acct_type = "loan"
+                else:
+                    acct_type = "credit"
 
                 acct = {
                     "id": account_id,
@@ -680,39 +738,31 @@ class ChaseScraper(BaseScraper):
                     "last4": last4,
                     "balance": 0,
                     "available_credit": None,
+                    "account_type": acct_type,
                 }
 
-                if card.get("href"):
-                    acct["url"] = card["href"]
-
-                text = card.get("text", "")
-                if not text or "Current balance" not in text:
-                    text = page_text
-
-                balance_match = re.search(
-                    r'\$([\d,]+\.\d{2})\s*\n?\s*Current balance', text
-                )
-                if not balance_match:
-                    balance_match = re.search(
-                        r'Current balance\s*\n?\s*\$([\d,]+\.\d{2})', text
-                    )
+                # Parse balance from dollar string
+                balance_str = card.get("balance", "")
+                balance_match = re.search(r'\$([\d,]+\.\d{2})', balance_str)
                 if balance_match:
                     acct["balance"] = float(balance_match.group(1).replace(",", ""))
 
-                avail_match = re.search(
-                    r'\$([\d,]+\.\d{2})\s*\n?\s*Available credit', text
-                )
-                if not avail_match:
-                    avail_match = re.search(
-                        r'Available credit\s*\n?\s*\$([\d,]+\.\d{2})', text
-                    )
+                # Parse available credit
+                avail_str = card.get("available_credit", "")
+                avail_match = re.search(r'\$([\d,]+\.\d{2})', avail_str)
                 if avail_match:
                     acct["available_credit"] = float(avail_match.group(1).replace(",", ""))
+
+                # Preserve the Chase account ID for transaction fetching
+                chase_acct_id = card.get("chase_acct_id", "")
+                if chase_acct_id:
+                    acct["chase_account_id"] = chase_acct_id
 
                 print(
                     f"   DOM: {name} ...{last4}: "
                     f"${acct['balance']:,.2f}, "
-                    f"avail=${acct.get('available_credit') or 0:,.2f}",
+                    f"avail=${acct.get('available_credit') or 0:,.2f}"
+                    f" [type={acct_type}, chase_id={chase_acct_id}]",
                     file=sys.stderr,
                 )
                 accounts.append(acct)
@@ -740,11 +790,11 @@ class ChaseScraper(BaseScraper):
 
         if not chase_acct_id:
             print(
-                f"   No Chase account ID for {account_name}, skipping transactions. "
-                "This card was likely found via DOM only.",
+                f"   No Chase account ID for {account_name}, trying DOM fallback only.",
                 file=sys.stderr,
             )
-            return transactions
+            dom_txns = await self._extract_transactions_dom(page, account_id)
+            return dom_txns
 
         print(f"   Fetching transactions for {account_name}...", file=sys.stderr)
         try:
@@ -787,7 +837,86 @@ class ChaseScraper(BaseScraper):
                     txns = self._parse_transactions_from_api(data, account_id)
                     transactions.extend(txns)
 
+        # DOM fallback: scrape the visible activity table
+        if not transactions:
+            print(f"   Trying DOM transaction extraction for {account_name}...", file=sys.stderr)
+            dom_txns = await self._extract_transactions_dom(page, account_id)
+            transactions.extend(dom_txns)
+
         print(f"   Total {len(transactions)} transactions for {account_name}", file=sys.stderr)
+        return transactions
+
+    async def _extract_transactions_dom(self, page, account_id: str) -> list[dict]:
+        """Extract transactions from the visible activity table via DOM.
+
+        Chase's activity table rows have a ``data-values`` attribute with the
+        format ``"date,description,amount,"``.  Each row also contains cells
+        accessible via ``data-testid`` and class selectors.
+        """
+        transactions = []
+        try:
+            row_data = await page.evaluate(r'''() => {
+                const rows = [];
+                const table = document.querySelector('.mds-activity-table');
+                if (!table) return rows;
+                const trs = table.querySelectorAll('tbody tr[data-values]');
+                for (const tr of trs) {
+                    const vals = tr.getAttribute('data-values') || '';
+                    // data-values format: "date,description,amount,"
+                    const parts = vals.split(',');
+                    if (parts.length < 3) continue;
+                    const date = parts[0].trim();
+                    const desc = parts[1].trim();
+                    const amount = parts[2].trim();
+                    if (!desc || !amount) continue;
+                    rows.push({ date, description: desc, amount });
+                }
+                return rows;
+            }''')
+
+            for row in (row_data or []):
+                date_str = row.get("date", "")
+                desc = row.get("description", "")
+                amount_str = row.get("amount", "")
+
+                # Determine status
+                status = "pending" if "pending" in date_str.lower() else "posted"
+
+                # Parse amount
+                amount_match = re.search(r'\$?([\d,]+\.\d{2})', amount_str)
+                if not amount_match:
+                    continue
+                amount = -float(amount_match.group(1).replace(",", ""))
+
+                # Normalize date (pending rows won't have a real date)
+                iso_date = ""
+                if status == "posted":
+                    iso_date = self._normalize_date(date_str)
+                if not iso_date and status == "pending":
+                    iso_date = ""  # pending transactions often lack dates
+
+                txn_id = hashlib.md5(
+                    f"chase_dom_{iso_date}_{desc}_{amount}".encode()
+                ).hexdigest()[:16]
+
+                category = self._infer_category(desc)
+
+                transactions.append({
+                    "id": txn_id,
+                    "account_id": account_id,
+                    "date": iso_date,
+                    "description": desc[:100],
+                    "amount": amount,
+                    "category": category,
+                    "status": status,
+                })
+
+            if transactions:
+                print(f"   DOM table: {len(transactions)} transactions", file=sys.stderr)
+
+        except Exception as e:
+            print(f"   DOM transaction extraction failed: {e}", file=sys.stderr)
+
         return transactions
 
     # -- Helpers ----------------------------------------------------------

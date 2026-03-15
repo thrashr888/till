@@ -30,9 +30,9 @@ class MorganstanleyScraper(BaseScraper):
     LOGIN_URL = "https://login.morganstanley.com/SignIn/"
     DASHBOARD_URL = "https://www.morganstanley.com/what-we-do/wealth-management"
 
-    # Workplace (StockPlan Connect) URLs
-    WORKPLACE_LOGIN_URL = "https://stockplanconnect.morganstanley.com"
-    WORKPLACE_DASHBOARD_URL = "https://stockplanconnect.morganstanley.com/app/myholdings"
+    # Workplace (Morgan Stanley at Work / Solium) URLs
+    WORKPLACE_LOGIN_URL = "https://atwork.morganstanley.com/solium/servlet/userLogin"
+    WORKPLACE_DASHBOARD_URL = "https://atwork.morganstanley.com/solium/servlet/ui/dashboard"
 
     def __init__(self, headless: bool = True):
         # Morgan Stanley detects headless — force headful
@@ -84,8 +84,13 @@ class MorganstanleyScraper(BaseScraper):
         current_url = page.url
         print(f"   Session check URL: {current_url}", file=sys.stderr)
 
-        # Session is valid if we didn't get redirected to login
-        if "signin" not in current_url.lower() and "login" not in current_url.lower():
+        # Session is valid if we're on a dashboard/portfolio page (not login)
+        if self.variant == "workplace":
+            # Workplace: logged in if we're on /ui/dashboard or /ui/portfolio
+            if "/ui/dashboard" in current_url or "/ui/portfolio" in current_url:
+                print("   Session active, skipping login", file=sys.stderr)
+                return
+        elif "signin" not in current_url.lower() and "login" not in current_url.lower():
             print("   Session active, skipping login", file=sys.stderr)
             return
 
@@ -102,12 +107,14 @@ class MorganstanleyScraper(BaseScraper):
 
         print("   Auto-filling login credentials...", file=sys.stderr)
         try:
-            # Username field — try most common selectors
+            # Username field — workplace uses input[type="text"], personal uses #username
+            username_selectors = (
+                ['input[type="text"]', '#username', '#userName', 'input[name="username"]']
+                if self.variant == "workplace"
+                else ['#username', '#userName', 'input[name="username"]', 'input[type="text"]']
+            )
             username_field = None
-            for selector in [
-                '#username', '#userName', 'input[name="username"]',
-                'input[type="text"]',
-            ]:
+            for selector in username_selectors:
                 try:
                     loc = page.locator(selector).first
                     await loc.wait_for(timeout=3000)
@@ -130,7 +137,7 @@ class MorganstanleyScraper(BaseScraper):
             await username_field.type(username, delay=50)
             await page.wait_for_timeout(500)
 
-            # Find password field
+            # Find password field — workplace uses #password
             password_field = None
             for selector in [
                 '#password', 'input[name="password"]', 'input[type="password"]',
@@ -146,7 +153,8 @@ class MorganstanleyScraper(BaseScraper):
             if not password_field:
                 # Some MS login flows show password on a second step
                 for btn_sel in [
-                    'button[type="submit"]', 'button:has-text("Next")',
+                    'input[type="submit"]', 'button[type="submit"]',
+                    'button:has-text("Next")',
                 ]:
                     try:
                         btn = page.locator(btn_sel).first
@@ -182,12 +190,16 @@ class MorganstanleyScraper(BaseScraper):
             await password_field.type(password, delay=30)
             await page.wait_for_timeout(500)
 
-            # Click submit
+            # Click submit — workplace uses input[type="submit"]
+            submit_selectors = (
+                ['input[type="submit"]', 'button[type="submit"]',
+                 'button:has-text("Sign In")', 'button:has-text("Log In")']
+                if self.variant == "workplace"
+                else ['button[type="submit"]', 'button:has-text("Sign In")',
+                      'button:has-text("Log In")', 'input[type="submit"]']
+            )
             submitted = False
-            for btn_sel in [
-                'button[type="submit"]', 'button:has-text("Sign In")',
-                'button:has-text("Log In")', 'input[type="submit"]',
-            ]:
+            for btn_sel in submit_selectors:
                 try:
                     btn = page.locator(btn_sel).first
                     if await btn.is_visible():
@@ -205,24 +217,26 @@ class MorganstanleyScraper(BaseScraper):
                 )
 
             print("   Waiting for login...", file=sys.stderr)
+
+            # Wait for redirect away from login page
+            def _is_logged_in(url: str) -> bool:
+                u = url.lower()
+                if self.variant == "workplace":
+                    return "/ui/dashboard" in u or "/ui/portfolio" in u
+                return "signin" not in u and "login" not in u
+
             try:
-                await page.wait_for_url(
-                    lambda url: "signin" not in url.lower() and "login" not in url.lower(),
-                    timeout=30000,
-                )
+                await page.wait_for_url(_is_logged_in, timeout=30000)
             except Exception:
                 pass
 
-            if "signin" not in page.url.lower() and "login" not in page.url.lower():
+            if _is_logged_in(page.url):
                 print("   Login successful!", file=sys.stderr)
             else:
                 print("   Waiting for 2FA...", file=sys.stderr)
                 await self._save_debug_snapshot(page, "2fa")
                 try:
-                    await page.wait_for_url(
-                        lambda url: "signin" not in url.lower() and "login" not in url.lower(),
-                        timeout=30000,
-                    )
+                    await page.wait_for_url(_is_logged_in, timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
                     await self._save_debug_snapshot(page, "login_fail")
@@ -283,9 +297,9 @@ class MorganstanleyScraper(BaseScraper):
         ]
         if self.variant == "workplace":
             api_endpoints = [
-                "https://stockplanconnect.morganstanley.com/api/myholdings",
-                "https://stockplanconnect.morganstanley.com/api/accounts/summary",
-                "https://stockplanconnect.morganstanley.com/api/portfolio",
+                "https://atwork.morganstanley.com/solium/servlet/api/myholdings",
+                "https://atwork.morganstanley.com/solium/servlet/api/accounts/summary",
+                "https://atwork.morganstanley.com/solium/servlet/api/portfolio",
             ]
 
         for endpoint in api_endpoints:
@@ -435,8 +449,8 @@ class MorganstanleyScraper(BaseScraper):
         activity_urls = []
         if self.variant == "workplace":
             activity_urls = [
-                "https://stockplanconnect.morganstanley.com/app/transactions",
-                "https://stockplanconnect.morganstanley.com/app/activity",
+                "https://atwork.morganstanley.com/solium/servlet/ui/activity",
+                "https://atwork.morganstanley.com/solium/servlet/ui/activity/past-events",
             ]
         else:
             activity_urls = [
@@ -465,8 +479,8 @@ class MorganstanleyScraper(BaseScraper):
         ]
         if self.variant == "workplace":
             txn_api_endpoints = [
-                "https://stockplanconnect.morganstanley.com/api/transactions",
-                "https://stockplanconnect.morganstanley.com/api/activity",
+                "https://atwork.morganstanley.com/solium/servlet/api/transactions",
+                "https://atwork.morganstanley.com/solium/servlet/api/activity",
             ]
 
         for endpoint in txn_api_endpoints:
@@ -802,35 +816,153 @@ class MorganstanleyScraper(BaseScraper):
         return accounts
 
     async def _extract_workplace_dom(self, page) -> list[dict]:
-        """Fallback: extract workplace/StockPlan Connect accounts from DOM."""
+        """Extract workplace (Morgan Stanley at Work) accounts from dashboard page text.
+
+        The dashboard shows:
+          - Total portfolio value: $X
+          - Available value section with account names, balances, and share counts
+          - Unavailable value section with account names, balances, and share counts
+
+        Example page text layout:
+          Available value
+          $14,132.78
+          IBM Long Share Account
+          $14,132.7857.38 shares
+          Unavailable value
+          $388,383.56
+          Share Units (RSU)
+          $388,383.561,577 Share Units (RSU)
+        """
         accounts = []
 
-        for selector in [
-            '[data-testid*="holding"]', '.holding-row', 'div[class*="Holding"]',
-        ]:
-            rows = await page.query_selector_all(selector)
-            if rows:
-                print(f"   DOM: found {len(rows)} rows with {selector}", file=sys.stderr)
-                for row in rows:
-                    try:
-                        acct = await self._parse_dom_row(row)
-                        if acct:
-                            accounts.append(acct)
-                    except Exception as e:
-                        print(f"   DOM parse error: {e}", file=sys.stderr)
-                if accounts:
-                    break
+        # Get the full page text
+        page_text = await page.inner_text('body')
+        lines = [l.strip() for l in page_text.split('\n') if l.strip()]
 
-        # Broader fallback
-        if not accounts:
-            rows = await page.query_selector_all('table tbody tr')
-            for row in rows:
-                try:
-                    acct = await self._parse_dom_row(row)
-                    if acct:
-                        accounts.append(acct)
-                except Exception:
+        print(f"   DOM: parsing {len(lines)} text lines from workplace dashboard", file=sys.stderr)
+
+        # Parse Available and Unavailable sections
+        for section_label, availability in [("Available value", "available"), ("Unavailable value", "unavailable")]:
+            try:
+                # Find the section header line index
+                section_idx = None
+                for i, line in enumerate(lines):
+                    if line == section_label:
+                        section_idx = i
+                        break
+
+                if section_idx is None:
+                    print(f"   DOM: could not find '{section_label}' section", file=sys.stderr)
                     continue
+
+                # The section total is the next line (e.g. "$14,132.78")
+                section_total_idx = section_idx + 1
+                if section_total_idx >= len(lines):
+                    continue
+
+                section_total_str = lines[section_total_idx]
+                section_total_match = re.search(r'\$([\d,]+\.?\d*)', section_total_str)
+                if not section_total_match:
+                    continue
+
+                section_total = float(section_total_match.group(1).replace(',', ''))
+                print(f"   DOM: {section_label} total: ${section_total:,.2f}", file=sys.stderr)
+
+                # Scan subsequent lines for account entries.
+                # Pattern: account name line, then "$balance<shares> shares" or "$balance<N> Share Units"
+                # e.g. "IBM Long Share Account" followed by "$14,132.7857.38 shares"
+                # e.g. "Share Units (RSU)" followed by "$388,383.561,577 Share Units (RSU)"
+                i = section_total_idx + 1
+                # Look ahead for account entries until we hit a section boundary
+                boundary_markers = [
+                    "Unavailable value", "Available value", "Upcoming events",
+                    "Past events", "Quick Links", "Your Equity Education",
+                    "Timeline", "Tasks",
+                ]
+                while i < len(lines):
+                    line = lines[i]
+
+                    # Stop if we hit a section boundary
+                    if any(line.startswith(m) for m in boundary_markers):
+                        break
+
+                    # Skip non-account lines (navigation, details links, disclaimers, etc.)
+                    if line in ("Transact", "Timeline", "Disclaimer", "details", "Slide 1 of 2") or line.endswith("details"):
+                        i += 1
+                        continue
+
+                    # Try to find account name + value pattern.
+                    # The value line has format: $<balance><shares> shares
+                    # or: $<balance><N> Share Units (RSU)
+                    # Look at next line for the combined balance+shares string
+                    if i + 1 < len(lines):
+                        next_line = lines[i + 1]
+                        # Match: $402,516.3457.38 shares  or  $388,383.561,577 Share Units (RSU)
+                        combined_match = re.match(
+                            r'\$([\d,]+\.?\d*)([\d,.]+)\s+(shares?|Share\s+Units.*)',
+                            next_line,
+                        )
+                        if combined_match:
+                            acct_name = line
+                            balance = float(combined_match.group(1).replace(',', ''))
+                            shares_str = combined_match.group(2).replace(',', '')
+                            try:
+                                shares = float(shares_str)
+                            except ValueError:
+                                shares = 0.0
+                            share_desc = combined_match.group(3).strip()
+
+                            acct_type = "brokerage"
+                            if "rsu" in acct_name.lower() or "rsu" in share_desc.lower():
+                                acct_type = "brokerage"
+
+                            print(
+                                f"   DOM: {acct_name}: ${balance:,.2f} "
+                                f"({shares} shares, {availability})",
+                                file=sys.stderr,
+                            )
+
+                            # Use availability + account name to create a stable suffix
+                            suffix = hashlib.md5(
+                                f"{availability}_{acct_name}".encode()
+                            ).hexdigest()[:4]
+
+                            accounts.append({
+                                "name": f"{acct_name} ({availability.title()})",
+                                "balance": balance,
+                                "type": acct_type,
+                                "account_suffix": suffix,
+                                "day_change": None,
+                                "day_change_percent": None,
+                                "shares": shares,
+                                "availability": availability,
+                            })
+                            i += 2  # skip the value line
+                            continue
+
+                    i += 1
+
+            except Exception as e:
+                print(f"   DOM: error parsing {section_label}: {e}", file=sys.stderr)
+
+        # If we found nothing from sections, try to at least get the total portfolio value
+        if not accounts:
+            print("   DOM: no accounts from sections, trying total portfolio value", file=sys.stderr)
+            for i, line in enumerate(lines):
+                if line == "Total portfolio value" and i + 1 < len(lines):
+                    total_match = re.search(r'\$([\d,]+\.?\d*)', lines[i + 1])
+                    if total_match:
+                        total = float(total_match.group(1).replace(',', ''))
+                        print(f"   DOM: total portfolio value: ${total:,.2f}", file=sys.stderr)
+                        accounts.append({
+                            "name": "Morgan Stanley at Work Portfolio",
+                            "balance": total,
+                            "type": "brokerage",
+                            "account_suffix": "msaw",
+                            "day_change": None,
+                            "day_change_percent": None,
+                        })
+                    break
 
         return accounts
 

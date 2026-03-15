@@ -22,7 +22,7 @@ def _mask_acct(num: str) -> str:
 
 class AmexScraper(BaseScraper):
     LOGIN_URL = "https://www.americanexpress.com/en-us/account/login"
-    DASHBOARD_URL = "https://global.americanexpress.com/dashboard"
+    DASHBOARD_URL = "https://global.americanexpress.com/overview"
 
     def __init__(self, headless: bool = True):
         # Amex always requires headful — heavy bot detection
@@ -59,8 +59,8 @@ class AmexScraper(BaseScraper):
         current_url = page.url
         print(f"   Session check URL: {current_url}", file=sys.stderr)
 
-        # Session is valid if we stayed on dashboard (not redirected to login)
-        if "dashboard" in current_url and "login" not in current_url.lower():
+        # Session is valid if we stayed on overview/dashboard (not redirected to login)
+        if ("overview" in current_url or "dashboard" in current_url) and "login" not in current_url.lower():
             print("   Session active, skipping login", file=sys.stderr)
             return
 
@@ -102,13 +102,13 @@ class AmexScraper(BaseScraper):
             except Exception:
                 pass
 
-            if "dashboard" in page.url:
+            if "overview" in page.url or "dashboard" in page.url:
                 print("   Login successful!", file=sys.stderr)
             else:
                 print("   Waiting for 2FA...", file=sys.stderr)
                 await self._save_debug_snapshot(page, "2fa")
                 try:
-                    await page.wait_for_url("**/dashboard**", timeout=30000)
+                    await page.wait_for_url("**/overview**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
                     await self._save_debug_snapshot(page, "login_fail")
@@ -275,7 +275,7 @@ class AmexScraper(BaseScraper):
             account_results.append({
                 "account_id": account_id,
                 "account_name": f"{acct['name']} {_mask_acct(suffix)}" if suffix else acct["name"],
-                "account_type": "credit",
+                "account_type": acct.get("type", "credit"),
                 "balance": acct["balance"],
                 "available_credit": acct.get("available_credit"),
                 "payment_due": acct.get("payment_due"),
@@ -394,55 +394,128 @@ class AmexScraper(BaseScraper):
         return accounts
 
     async def _extract_accounts_dom(self, page) -> list[dict]:
-        """Fallback: extract credit card accounts from DOM."""
+        """Fallback: extract credit card accounts from DOM.
+
+        Amex patches JS introspection, so this method uses only Playwright
+        locator APIs and text parsing -- no page.evaluate() calls.
+
+        The overview page shows account cards with text like:
+            Marriott Bonvoy Brilliant... Card ....44003
+            Total Balance
+            $0.00
+        """
         accounts = []
 
-        # Amex dashboard shows card tiles with balance info
+        # Strategy 1: Parse the full page text content for account blocks.
+        # Amex renders account cards sequentially; we can extract them from
+        # the visible text without relying on specific DOM selectors.
+        try:
+            body_text = await page.locator("body").inner_text()
+            accounts = self._parse_accounts_from_text(body_text)
+            if accounts:
+                print(f"   DOM (text parse): found {len(accounts)} accounts", file=sys.stderr)
+                return accounts
+        except Exception as e:
+            print(f"   Text parse failed: {e}", file=sys.stderr)
+
+        # Strategy 2: Try known Amex selectors for account tiles
         for selector in [
             '[data-testid*="account"]', '[class*="card-chapter"]',
-            'section[class*="card"]',
+            'section[class*="card"]', '[data-module-name*="account"]',
         ]:
-            cards = await page.query_selector_all(selector)
-            if cards:
-                print(f"   Found {len(cards)} card elements with: {selector}", file=sys.stderr)
-                for card in cards:
+            cards = page.locator(selector)
+            count = await cards.count()
+            if count > 0:
+                print(f"   Found {count} card elements with: {selector}", file=sys.stderr)
+                for i in range(count):
                     try:
+                        card = cards.nth(i)
                         text = await card.inner_text()
-                        lines = [l.strip() for l in text.split("\n") if l.strip()]
-                        if not lines:
-                            continue
-
-                        name = lines[0]
-                        balance = None
-                        available_credit = None
-
-                        for line in lines:
-                            if "$" in line:
-                                amount = self._parse_dollar(line)
-                                if amount is not None:
-                                    if "available" in line.lower() or "credit" in line.lower():
-                                        available_credit = amount
-                                    elif "payment" in line.lower() or "due" in line.lower():
-                                        pass  # skip payment amounts for balance
-                                    elif balance is None:
-                                        balance = amount
-
-                        if balance is not None:
-                            suffix_match = re.search(r'[\-\s*x](\d{4,5})\b', text)
-                            suffix = suffix_match.group(1) if suffix_match else ""
-
-                            print(f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f}", file=sys.stderr)
-                            accounts.append({
-                                "name": name,
-                                "balance": balance,
-                                "type": "credit",
-                                "account_suffix": suffix,
-                                "available_credit": available_credit,
-                            })
+                        parsed = self._parse_accounts_from_text(text)
+                        accounts.extend(parsed)
                     except Exception as e:
                         print(f"   DOM parse error: {e}", file=sys.stderr)
                 if accounts:
                     break
+
+        return accounts
+
+    def _parse_accounts_from_text(self, text: str) -> list[dict]:
+        """Parse account info from visible page text.
+
+        Looks for patterns like:
+            <Card Name> ....44003
+            Total Balance / Outstanding Loan Balance
+            $0.00
+
+        Works without JS -- just string parsing of innerText.
+        """
+        accounts = []
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+
+        # Pattern: account number suffix appears as ....NNNNN or ----NNNNN
+        # Unicode bullets: \u2022, \u00b7, or plain dots/dashes/x's
+        acct_pattern = re.compile(
+            r'(.+?)\s*[\u2022\u00b7\.\-x*]{2,}\s*(\d{4,5})\s*$'
+        )
+        balance_label_pattern = re.compile(
+            r'(total\s+balance|outstanding.*balance|current\s+balance|statement\s+balance)',
+            re.IGNORECASE,
+        )
+
+        i = 0
+        while i < len(lines):
+            match = acct_pattern.search(lines[i])
+            if match:
+                name = match.group(1).strip()
+                suffix = match.group(2)
+
+                # Skip non-account matches (e.g. loyalty lines, nav items)
+                if len(name) < 5 or any(
+                    skip in name.lower()
+                    for skip in ['loyalty', 'points', 'rewards', 'login', 'footer']
+                ):
+                    i += 1
+                    continue
+
+                # Look ahead for a balance label + dollar amount
+                balance = None
+                available_credit = None
+                acct_type = "credit"
+
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    line = lines[j]
+
+                    # Stop if we hit the next account card
+                    if acct_pattern.search(line):
+                        break
+
+                    if balance_label_pattern.search(line):
+                        if "loan" in line.lower():
+                            acct_type = "loan"
+
+                    if "$" in line and balance is None:
+                        amount = self._parse_dollar(line)
+                        if amount is not None:
+                            if "available" in line.lower() or "credit" in line.lower():
+                                available_credit = amount
+                            else:
+                                balance = amount
+
+                if balance is not None:
+                    print(
+                        f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f}",
+                        file=sys.stderr,
+                    )
+                    accounts.append({
+                        "name": name,
+                        "balance": balance,
+                        "type": acct_type,
+                        "account_suffix": suffix,
+                        "available_credit": available_credit,
+                    })
+
+            i += 1
 
         return accounts
 
@@ -532,18 +605,21 @@ class AmexScraper(BaseScraper):
             id_key = f"amex_{suffix}" if suffix else accounts[0]["name"]
             default_acct_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
 
-        # Amex transaction rows — top selectors only
+        # Amex transaction rows — use locators (no JS evaluation needed)
+        rows_locator = None
         for selector in [
             '[data-testid*="transaction"]', 'tr[class*="transaction"]',
         ]:
-            rows = await page.query_selector_all(selector)
-            if rows:
-                print(f"   Found {len(rows)} transaction rows with: {selector}", file=sys.stderr)
+            loc = page.locator(selector)
+            count = await loc.count()
+            if count > 0:
+                rows_locator = loc
+                print(f"   Found {count} transaction rows with: {selector}", file=sys.stderr)
                 break
-        else:
-            rows = []
 
-        for row in rows:
+        row_count = await rows_locator.count() if rows_locator else 0
+        for idx in range(row_count):
+            row = rows_locator.nth(idx)
             try:
                 text = await row.inner_text()
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
