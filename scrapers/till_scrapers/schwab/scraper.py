@@ -24,12 +24,22 @@ class SchwabScraper(BaseScraper):
         self.include_accounts = [s.strip() for s in include_str.split(",") if s.strip()] if include_str else []
 
     async def navigate_and_login(self, page, username: str, password: str):
-        print(f"   Navigating to {self.LOGIN_URL}", file=sys.stderr)
-        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=300000)
+        # Try accounts page first — session cookies may still be valid
+        print("   Checking for active session...", file=sys.stderr)
+        await page.goto(
+            "https://client.schwab.com/app/accounts/summary/",
+            wait_until="domcontentloaded",
+            timeout=60000,
+        )
+        await page.wait_for_timeout(2000)
 
         if "client.schwab.com/app/accounts" in page.url:
-            print("   Already logged in (session active)", file=sys.stderr)
+            print("   Session active, skipping login", file=sys.stderr)
             return
+
+        # Session expired — go to login page
+        print(f"   Session expired, logging in...", file=sys.stderr)
+        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=300000)
 
         if not (username and password):
             raise Exception(
@@ -369,56 +379,139 @@ class SchwabScraper(BaseScraper):
         return accounts
 
     async def _extract_transactions_api(self, page, api_responses: dict) -> list[dict]:
-        """Navigate to history page and intercept the transaction API call."""
+        """Navigate to transaction history, select checking account, capture API data.
+
+        Strategy:
+        1. Go to /app/accounts/history/ (loads default account's transactions)
+        2. Capture any API responses from the default load
+        3. Switch to the checking account via dropdown
+        4. Wait for new API responses with bank transactions
+        """
+        transactions = []
+
         print("   Loading transaction history...", file=sys.stderr)
         await page.goto(
             "https://client.schwab.com/app/accounts/history/#/",
             wait_until="domcontentloaded",
             timeout=60000,
         )
-        await page.wait_for_timeout(10000)
+        await page.wait_for_timeout(8000)
+        await page.screenshot(path="/tmp/till_schwab_history_default.png")
 
-        await page.screenshot(path="/tmp/till_schwab_history.png")
+        # Capture transactions from default account load
+        transactions.extend(self._collect_transactions_from_responses(api_responses))
 
-        # Check intercepted API responses for transaction data
-        transactions = []
-        for url, data in api_responses.items():
-            url_lower = url.lower()
-            if 'transactionhistory' in url_lower and 'ausgateway' in url_lower:
-                print(f"   Transaction API: {url[:100]}", file=sys.stderr)
-                # Log the top-level keys to understand the shape
-                if isinstance(data, dict):
-                    print(f"   Response keys: {list(data.keys())[:10]}", file=sys.stderr)
-                    # Log first transaction if available
-                    for key in data:
-                        val = data[key]
-                        if isinstance(val, list) and val:
-                            print(f"   {key}: {len(val)} items, first keys: {list(val[0].keys())[:8] if isinstance(val[0], dict) else type(val[0])}", file=sys.stderr)
-                elif isinstance(data, list) and data:
-                    print(f"   Response is list of {len(data)}, first keys: {list(data[0].keys())[:8] if isinstance(data[0], dict) else type(data[0])}", file=sys.stderr)
-                txns = self._parse_transactions_from_api(data)
-                transactions.extend(txns)
+        # Now switch to the checking account if configured
+        if self.transaction_account:
+            print(f"   Selecting account ...{self.transaction_account}...", file=sys.stderr)
+
+            # Find the account dropdown button (contains …XXX pattern)
+            dropdown_btn = None
+            for btn in await page.query_selector_all('button'):
+                try:
+                    text = await btn.inner_text()
+                    if re.search(r'(?:…|\.\.\.)[\d-]{2,4}', text) and await btn.is_visible():
+                        dropdown_btn = btn
+                        break
+                except Exception:
+                    continue
+
+            if dropdown_btn:
+                btn_text = (await dropdown_btn.inner_text()).strip()
+                print(f"   Dropdown shows: {btn_text[:50]}", file=sys.stderr)
+
+                if self.transaction_account not in btn_text:
+                    # Need to switch accounts
+                    await dropdown_btn.click()
+                    await page.wait_for_timeout(2000)
+
+                    # Clear captured responses before switching
+                    api_responses.clear()
+
+                    # Click the target account
+                    found = False
+                    for elem in await page.query_selector_all('li, a, div[role="option"]'):
+                        try:
+                            text = await elem.inner_text()
+                            if self.transaction_account in text and await elem.is_visible():
+                                if 'TRANSFER' not in text.upper():
+                                    print(f"   Clicking: {text.strip()[:60]}", file=sys.stderr)
+                                    await elem.click()
+                                    found = True
+                                    break
+                        except Exception:
+                            continue
+
+                    if found:
+                        # Wait for new API responses
+                        await page.wait_for_timeout(8000)
+                        await page.screenshot(path="/tmp/till_schwab_history_checking.png")
+
+                        # Capture bank transactions
+                        new_txns = self._collect_transactions_from_responses(api_responses)
+                        transactions.extend(new_txns)
+                    else:
+                        print(f"   Could not find ...{self.transaction_account} in dropdown", file=sys.stderr)
+                else:
+                    print(f"   Already showing ...{self.transaction_account}", file=sys.stderr)
+            else:
+                print("   No account dropdown found on history page", file=sys.stderr)
+
+        # Save captured API data for offline debugging
+        if api_responses:
+            debug_path = "/tmp/till_schwab_api_dump.json"
+            try:
+                with open(debug_path, 'w') as f:
+                    # Filter to transaction-related responses
+                    txn_data = {
+                        url: data for url, data in api_responses.items()
+                        if 'transactionhistory' in url.lower() and 'ausgateway' in url.lower()
+                    }
+                    json.dump(txn_data, f, indent=2, default=str)
+                print(f"   Saved API dump to {debug_path}", file=sys.stderr)
+            except Exception:
+                pass
 
         if transactions:
             return transactions
 
-        # If no API captured, try scraping the visible table
-        print("   No transaction API captured, trying DOM table...", file=sys.stderr)
-
-        # Wait for table with populated rows
+        # Fallback: try DOM table
+        print("   No transactions from API, trying DOM...", file=sys.stderr)
         try:
             await page.wait_for_function(
-                """() => {
-                    const rows = document.querySelectorAll('table tbody tr td');
-                    return rows.length > 0;
-                }""",
-                timeout=15000,
+                "() => document.querySelectorAll('table tbody tr td').length > 0",
+                timeout=10000,
             )
+            return await self._extract_transactions_dom(page)
         except Exception:
             print("   No table rows found", file=sys.stderr)
             return []
 
-        return await self._extract_transactions_dom(page)
+    def _collect_transactions_from_responses(self, api_responses: dict) -> list[dict]:
+        """Parse all transaction API responses collected so far."""
+        transactions = []
+        for url, data in api_responses.items():
+            url_lower = url.lower()
+            if 'transactionhistory' not in url_lower or 'ausgateway' not in url_lower:
+                continue
+            if not isinstance(data, dict):
+                continue
+            keys = list(data.keys())
+            # Skip config/metadata responses (only have flags/profile)
+            if set(keys) <= {'flags', 'profile', 'accountSelectorData'}:
+                continue
+            # Log what we got
+            print(f"   API response keys: {keys[:10]}", file=sys.stderr)
+            for k in keys:
+                v = data[k]
+                if isinstance(v, list):
+                    sample = list(v[0].keys())[:6] if v and isinstance(v[0], dict) else str(type(v[0]) if v else 'empty')
+                    print(f"     {k}: {len(v)} items, sample: {sample}", file=sys.stderr)
+            txns = self._parse_transactions_from_api(data)
+            if txns:
+                print(f"   Parsed {len(txns)} transactions from API", file=sys.stderr)
+                transactions.extend(txns)
+        return transactions
 
     def _parse_transactions_from_api(self, data) -> list[dict]:
         """Parse transactions from Schwab's intercepted API response.
@@ -435,11 +528,12 @@ class SchwabScraper(BaseScraper):
         elif isinstance(data, dict):
             # Try all known transaction array keys
             for key in [
+                'postedTransactions', 'pendingTransactions',
                 'brokerageTransactions', 'bankTransactions',
                 'Transactions', 'transactions',
                 'TransactionList', 'Items', 'items',
             ]:
-                if key in data and isinstance(data[key], list):
+                if key in data and isinstance(data[key], list) and data[key]:
                     items = data[key]
                     print(f"   Found {len(items)} transactions in '{key}'", file=sys.stderr)
                     break
@@ -450,10 +544,11 @@ class SchwabScraper(BaseScraper):
             if not isinstance(item, dict):
                 continue
 
-            # Handle various field naming conventions
+            # Handle various field naming conventions across brokerage/bank responses
             date = (
-                item.get('transactionDate') or item.get('TransactionDate') or
-                item.get('Date') or item.get('date') or ''
+                item.get('transactionDate') or item.get('postingDate') or
+                item.get('TransactionDate') or item.get('Date') or
+                item.get('date') or ''
             )
             desc = (
                 item.get('description') or item.get('Description') or
@@ -461,8 +556,23 @@ class SchwabScraper(BaseScraper):
             )
             amount = (
                 item.get('amount') or item.get('Amount') or
-                item.get('NetAmount') or item.get('netAmount') or 0
+                item.get('runningBalance') or item.get('NetAmount') or
+                item.get('netAmount') or 0
             )
+            # Bank transactions may have separate withdrawal/deposit fields
+            withdrawal = item.get('withdrawal') or item.get('Withdrawal')
+            deposit = item.get('deposit') or item.get('Deposit')
+            if withdrawal and not amount:
+                amount = withdrawal
+                if isinstance(amount, str):
+                    amount = amount.replace(',', '').replace('$', '')
+                amount = -abs(float(amount)) if amount else 0
+            elif deposit and not amount:
+                amount = deposit
+                if isinstance(amount, str):
+                    amount = amount.replace(',', '').replace('$', '')
+                amount = abs(float(amount)) if amount else 0
+
             action = item.get('action') or item.get('Action') or ''
             symbol = item.get('symbol') or item.get('Symbol') or ''
 
