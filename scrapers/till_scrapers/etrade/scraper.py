@@ -1,803 +1,496 @@
-"""E*Trade scraper.
+"""E*Trade scraper using pyetrade API (no browser needed).
 
-Strategy: Login via Playwright, then intercept E*Trade's internal API calls
-with page.on("response") to capture account and position data. Falls back
-to DOM extraction if API interception doesn't produce results.
+Uses OAuth 1.0a via pyetrade for API access. Credentials loaded from
+1Password CLI or environment variables. OAuth tokens persisted in
+macOS Keychain (service: "till-etrade").
+
+Usage:
+    scraper = EtradeScraper()
+    result = await scraper.scrape()
 """
 
-import re
-import sys
 import hashlib
 import json
+import logging
 import os
-from till_scrapers.base import BaseScraper
+import subprocess
+import sys
+import time
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+import keyring
+import pyetrade
+from requests_oauthlib import OAuth1Session
+
+logger = logging.getLogger(__name__)
+
+# Keychain config
+KEYCHAIN_SERVICE = "till-etrade"
+KEYCHAIN_TOKEN_KEY = "oauth_tokens"
+
+# E*Trade tokens expire after 2 hours
+TOKEN_MAX_AGE = 7000  # ~2h minus buffer
+
+# API timeout for all calls
+API_TIMEOUT = 30
 
 
-class EtradeScraper(BaseScraper):
-    LOGIN_URL = "https://us.etrade.com/etx/hw/v2/accountshome"
+def _op_read(ref: str) -> str | None:
+    """Read a secret from 1Password CLI. Returns None if op is unavailable."""
+    try:
+        result = subprocess.run(
+            ["op", "read", ref],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _load_credentials(sandbox: bool = True) -> tuple[str, str]:
+    """Load E*Trade API key and secret from 1Password or env vars.
+
+    Returns (consumer_key, consumer_secret).
+    """
+    if sandbox:
+        key_env, secret_env = "ETRADE_SANDBOX_API_KEY", "ETRADE_SANDBOX_API_SECRET"
+    else:
+        key_env, secret_env = "ETRADE_PROD_API_KEY", "ETRADE_PROD_API_SECRET"
+
+    key = None
+    secret = None
+
+    # Try 1Password first
+    key_op_ref = os.environ.get(f"{key_env}_OP")
+    secret_op_ref = os.environ.get(f"{secret_env}_OP")
+
+    if key_op_ref:
+        key = _op_read(key_op_ref)
+    if secret_op_ref:
+        secret = _op_read(secret_op_ref)
+
+    # Fall back to plain env vars
+    if not key:
+        key = os.environ.get(key_env)
+    if not secret:
+        secret = os.environ.get(secret_env)
+
+    if not key or not secret:
+        raise RuntimeError(
+            f"E*Trade API credentials not found. Set {key_env} and {secret_env} "
+            f"env vars, or {key_env}_OP / {secret_env}_OP for 1Password refs."
+        )
+
+    return key, secret
+
+
+@dataclass
+class OAuthTokens:
+    access_token: str
+    access_token_secret: str
+    timestamp: float
+
+    @property
+    def expired(self) -> bool:
+        return (time.time() - self.timestamp) > TOKEN_MAX_AGE
+
+    def to_dict(self) -> dict:
+        return {
+            "access_token": self.access_token,
+            "access_token_secret": self.access_token_secret,
+            "timestamp": self.timestamp,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "OAuthTokens":
+        return OAuthTokens(
+            access_token=d["access_token"],
+            access_token_secret=d["access_token_secret"],
+            timestamp=d["timestamp"],
+        )
+
+
+def _save_tokens(tokens: OAuthTokens) -> None:
+    """Save OAuth tokens to macOS Keychain."""
+    try:
+        keyring.set_password(
+            KEYCHAIN_SERVICE, KEYCHAIN_TOKEN_KEY, json.dumps(tokens.to_dict())
+        )
+    except Exception as e:
+        logger.warning("Keychain save failed: %s", e)
+
+
+def _load_tokens() -> OAuthTokens | None:
+    """Load OAuth tokens from macOS Keychain."""
+    try:
+        token_json = keyring.get_password(KEYCHAIN_SERVICE, KEYCHAIN_TOKEN_KEY)
+        if token_json:
+            return OAuthTokens.from_dict(json.loads(token_json))
+    except Exception as e:
+        logger.debug("Keychain load failed: %s", e)
+    return None
+
+
+def _authenticate_interactive(consumer_key: str, consumer_secret: str) -> OAuthTokens:
+    """Run the interactive OAuth browser flow. Returns tokens."""
+    session = OAuth1Session(
+        consumer_key, consumer_secret,
+        callback_uri="oob", signature_type="AUTH_HEADER",
+    )
+
+    # Step 1: Get request token
+    try:
+        request_tokens = session.fetch_request_token(
+            "https://api.etrade.com/oauth/request_token"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"E*Trade OAuth request token failed. Check your API keys. Error: {exc}"
+        ) from exc
+
+    req_token = request_tokens["oauth_token"]
+    req_secret = request_tokens["oauth_token_secret"]
+
+    authorize_url = (
+        f"https://us.etrade.com/e/t/etws/authorize"
+        f"?key={consumer_key}&token={req_token}"
+    )
+
+    print(f"\nOpening browser for E*Trade authorization...", file=sys.stderr)
+    print(f"URL: {authorize_url}", file=sys.stderr)
+    webbrowser.open(authorize_url)
+
+    verifier = input("Enter verification code from E*Trade: ").strip()
+
+    # Step 2: Exchange verifier for access tokens
+    session = OAuth1Session(
+        consumer_key, consumer_secret,
+        resource_owner_key=req_token,
+        resource_owner_secret=req_secret,
+        signature_type="AUTH_HEADER",
+    )
+    session._client.client.verifier = verifier
+
+    try:
+        token_data = session.fetch_access_token(
+            "https://api.etrade.com/oauth/access_token"
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"E*Trade access token exchange failed. "
+            f"The verification code may be expired. Error: {exc}"
+        ) from exc
+
+    tokens = OAuthTokens(
+        access_token=token_data["oauth_token"],
+        access_token_secret=token_data["oauth_token_secret"],
+        timestamp=time.time(),
+    )
+    _save_tokens(tokens)
+    return tokens
+
+
+def _get_tokens(consumer_key: str, consumer_secret: str) -> OAuthTokens:
+    """Load saved tokens or run interactive auth. Raises if non-interactive and no valid tokens."""
+    tokens = _load_tokens()
+
+    if tokens and not tokens.expired:
+        logger.info("Loaded saved tokens (age: %.0fs)", time.time() - tokens.timestamp)
+        return tokens
+
+    # Tokens exist but expired -- try renewal before full re-auth
+    if tokens:
+        try:
+            manager = pyetrade.ETradeAccessManager(
+                client_key=consumer_key,
+                client_secret=consumer_secret,
+                resource_owner_key=tokens.access_token,
+                resource_owner_secret=tokens.access_token_secret,
+            )
+            if manager.renew_access_token():
+                renewed = OAuthTokens(
+                    access_token=tokens.access_token,
+                    access_token_secret=tokens.access_token_secret,
+                    timestamp=time.time(),
+                )
+                _save_tokens(renewed)
+                logger.info("Token renewed successfully")
+                return renewed
+        except Exception:
+            logger.debug("Token renewal failed, will re-authenticate")
+
+    # Non-interactive: cannot prompt for verifier
+    if not sys.stdin.isatty():
+        reason = "expired" if tokens else "missing"
+        raise RuntimeError(
+            f"E*Trade authentication required (tokens {reason}). "
+            f"Run `till-scrape --source etrade` interactively to authenticate."
+        )
+
+    return _authenticate_interactive(consumer_key, consumer_secret)
+
+
+def _ensure_list(value) -> list:
+    """Normalize E*Trade API responses -- single dicts become [dict]."""
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return value
+    return []
+
+
+class EtradeScraper:
+    """E*Trade API scraper using pyetrade. No browser needed."""
 
     def __init__(self, headless: bool = True):
-        super().__init__(headless=headless)
+        # headless param accepted for interface compat but ignored (no browser)
+        sandbox_env = os.environ.get("ETRADE_SANDBOX", "").lower()
+        self.sandbox = sandbox_env in ("1", "true", "yes")
+        self.replay_file = None  # Not used, but runner may set it
 
-        include_str = os.environ.get("TILL_ETRADE_INCLUDE_ACCOUNTS", "")
-        self.include_accounts = (
-            [s.strip() for s in include_str.split(",") if s.strip()]
-            if include_str
-            else []
-        )
+    async def scrape(self, username=None, password=None) -> dict:
+        """Fetch accounts, positions, and transactions from E*Trade API.
 
-    async def navigate_and_login(self, page, username: str, password: str):
-        # Check for active session first by navigating to the accounts page
-        print("   Checking for active session...", file=sys.stderr)
+        Args are accepted for interface compat but ignored (uses OAuth, not username/password).
+        """
         try:
-            await page.goto(
-                self.LOGIN_URL,
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            await page.wait_for_timeout(3000)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
-        except Exception as e:
-            print(f"   Session check navigation error: {e}", file=sys.stderr)
+            consumer_key, consumer_secret = _load_credentials(sandbox=self.sandbox)
+        except RuntimeError as e:
+            return {
+                "status": "error",
+                "source": "etrade",
+                "error": str(e),
+                "accounts": [],
+                "transactions": [],
+                "positions": [],
+                "balance_history": [],
+            }
 
-        current_url = page.url
-        print(f"   Session check URL: {current_url}", file=sys.stderr)
-
-        # If we're not on a login page, session is active
-        if "login" not in current_url.lower() and "logon" not in current_url.lower():
-            print("   Session active, skipping login", file=sys.stderr)
-            return
-
-        # Session expired — need to login
-        print("   Session expired, logging in...", file=sys.stderr)
-
-        if not (username and password):
-            raise Exception(
-                "No credentials found. Use `till creds set --source etrade` "
-                "or set TILL_USERNAME/TILL_PASSWORD env vars."
-            )
-
-        print("   Auto-filling login credentials...", file=sys.stderr)
         try:
-            await page.wait_for_timeout(2000)
+            tokens = _get_tokens(consumer_key, consumer_secret)
+        except RuntimeError as e:
+            return {
+                "status": "error",
+                "source": "etrade",
+                "error": str(e),
+                "accounts": [],
+                "transactions": [],
+                "positions": [],
+                "balance_history": [],
+            }
 
-            # Fill username
-            print("   Entering username...", file=sys.stderr)
-            await page.wait_for_selector("#USER", timeout=5000)
-            await page.fill("#USER", username)
-            await page.wait_for_timeout(500)
+        dev = self.sandbox
+        accounts_api = pyetrade.ETradeAccounts(
+            client_key=consumer_key,
+            client_secret=consumer_secret,
+            resource_owner_key=tokens.access_token,
+            resource_owner_secret=tokens.access_token_secret,
+            dev=dev,
+        )
 
-            # Fill password
-            print("   Entering password...", file=sys.stderr)
-            await page.wait_for_selector("#password", timeout=5000)
-            await page.fill("#password", password)
-            await page.wait_for_timeout(500)
-
-            # Click login button
-            print("   Clicking login...", file=sys.stderr)
-            await page.wait_for_selector("#mfaLogonButton", timeout=5000)
-            await page.click("#mfaLogonButton")
-
-            # Wait for navigation after login
-            print("   Waiting for login to complete...", file=sys.stderr)
-            await page.wait_for_timeout(5000)
-
-            # Check if we landed on accounts page or need 2FA
-            current_url = page.url
-            if "login" in current_url.lower() or "logon" in current_url.lower():
-                print("   May need 2FA, waiting...", file=sys.stderr)
-                await page.screenshot(path="/tmp/till_etrade_2fa.png")
-                try:
-                    await page.wait_for_url(
-                        "**/etx/hw/**", timeout=120000
-                    )
-                    print("   Login successful after 2FA!", file=sys.stderr)
-                except Exception:
-                    await page.screenshot(path="/tmp/till_etrade_login.png")
-                    raise Exception(
-                        f"Login failed. URL: {page.url}. "
-                        "Check /tmp/till_etrade_login.png"
-                    )
-            else:
-                print("   Login successful!", file=sys.stderr)
-
+        # --- List accounts ---
+        print("   Fetching E*Trade accounts via API...", file=sys.stderr)
+        try:
+            acct_resp = accounts_api.list_accounts(resp_format="json")
         except Exception as e:
-            print(f"   Auto-login failed: {e}", file=sys.stderr)
-            await page.screenshot(path="/tmp/till_etrade_login.png")
-            raise
+            return {
+                "status": "error",
+                "source": "etrade",
+                "error": f"Failed to list accounts: {e}",
+                "accounts": [],
+                "transactions": [],
+                "positions": [],
+                "balance_history": [],
+            }
 
-        await page.wait_for_timeout(2000)
-
-    async def extract(self, page) -> dict:
-        """Extract accounts and positions using E*Trade's internal APIs."""
-
-        # Step 1: Set up API interception
-        api_responses = {}
-
-        async def capture_api(response):
-            url = response.url
-            if response.status == 200 and (
-                "/api/" in url
-                or "/rest/" in url
-                or "/services/" in url
-                or "portfolio" in url.lower()
-                or "account" in url.lower()
-                or "position" in url.lower()
-            ):
-                try:
-                    ct = response.headers.get("content-type", "")
-                    if "json" not in ct:
-                        return
-                    body = await response.text()
-                    if body and body.strip() and body.strip()[0] in "{[":
-                        api_responses[url] = json.loads(body)
-                        print(
-                            f"   API [{response.status}]: {url[:120]}",
-                            file=sys.stderr,
-                        )
-                except Exception:
-                    pass
-
-        page.on("response", capture_api)
-
-        # Step 2: Navigate to accounts page to trigger API calls
-        print("   Loading account summary...", file=sys.stderr)
-        await page.goto(
-            self.LOGIN_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
+        raw_accounts = _ensure_list(
+            acct_resp.get("AccountListResponse", {})
+            .get("Accounts", {})
+            .get("Account", [])
         )
-        await page.wait_for_timeout(8000)
 
-        await page.screenshot(path="/tmp/till_etrade_accounts.png")
-
-        # Step 3: Parse accounts from intercepted API responses
-        accounts = []
-        for url, data in api_responses.items():
-            if "account" in url.lower():
-                accounts_from_api = self._parse_accounts_from_api(data)
-                if accounts_from_api:
-                    accounts.extend(accounts_from_api)
-
-        # Fallback: DOM extraction if API didn't produce accounts
-        if not accounts or all(a["balance"] == 0 for a in accounts):
-            print(
-                "   API didn't return account data, falling back to DOM",
-                file=sys.stderr,
-            )
-            dom_accounts = await self._extract_accounts_dom(page)
-            if dom_accounts:
-                accounts = dom_accounts
-
-        # Filter by include_accounts
-        if self.include_accounts:
-            before = len(accounts)
-            accounts = [
-                a
-                for a in accounts
-                if a.get("account_suffix") in self.include_accounts
-                or any(inc in a.get("name", "") for inc in self.include_accounts)
-            ]
-            skipped = before - len(accounts)
-            if skipped:
-                print(
-                    f"   Filtered to {len(accounts)} accounts (skipped {skipped})",
-                    file=sys.stderr,
-                )
-
-        print(f"   Found {len(accounts)} accounts", file=sys.stderr)
-
-        # Step 4: Navigate to positions page to capture position API calls
-        positions = []
-        api_responses.clear()
-
-        print("   Loading positions page...", file=sys.stderr)
-        positions_url = (
-            "https://us.etrade.com/etx/pxy/portfolios/positions"
-            "?_formtarget=portfoliolist"
-        )
-        await page.goto(
-            positions_url,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        await page.wait_for_timeout(8000)
-
-        await page.screenshot(path="/tmp/till_etrade_positions.png")
-
-        # Parse positions from intercepted API responses
-        for url, data in api_responses.items():
-            if "position" in url.lower() or "portfolio" in url.lower():
-                positions_from_api = self._parse_positions_from_api(data, accounts)
-                if positions_from_api:
-                    positions.extend(positions_from_api)
-
-        # Fallback: DOM/text extraction if API didn't produce positions
-        if not positions:
-            print(
-                "   API didn't return position data, falling back to DOM",
-                file=sys.stderr,
-            )
-            target_account = accounts[0] if accounts else None
-            if target_account:
-                account_id = hashlib.md5(
-                    target_account["name"].encode()
-                ).hexdigest()[:16]
-                content = await page.inner_text("body")
-                positions = self._parse_positions_from_text(
-                    content, account_id, target_account["name"]
-                )
-
-        print(f"   Found {len(positions)} positions", file=sys.stderr)
-
-        # Save API dump for debugging
-        if api_responses:
-            debug_path = "/tmp/till_etrade_api_dump.json"
-            try:
-                with open(debug_path, "w") as f:
-                    json.dump(api_responses, f, indent=2, default=str)
-                print(f"   Saved API dump to {debug_path}", file=sys.stderr)
-            except Exception:
-                pass
-
-        # Build results
         account_results = []
-        for acct in accounts:
-            suffix = acct.get("account_suffix", "")
-            id_key = f"etrade_{suffix}" if suffix else acct["name"]
-            account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
-            account_results.append(
-                {
-                    "account_id": account_id,
-                    "account_name": (
-                        f"{acct['name']} ...{suffix}" if suffix else acct["name"]
-                    ),
-                    "account_type": acct.get("type", "brokerage"),
-                    "balance": acct["balance"],
-                    "day_change": acct.get("day_change"),
-                    "day_change_percent": acct.get("day_change_percent"),
-                }
+        all_positions = []
+        all_transactions = []
+
+        for acct in raw_accounts:
+            if acct.get("accountStatus") == "CLOSED":
+                continue
+
+            account_id_key = acct.get("accountIdKey", "")
+            account_name = acct.get("accountDesc", "").strip()
+            account_type = self._map_account_type(
+                acct.get("accountType", ""),
+                acct.get("institutionType", ""),
+                account_name,
             )
 
-        position_results = []
-        for pos in positions:
-            position_results.append(
-                {
-                    "position_id": pos["position_id"],
-                    "account_id": pos["account_id"],
-                    "symbol": pos["symbol"],
-                    "description": pos.get("description"),
-                    "quantity": pos.get("quantity"),
-                    "last_price": pos.get("last_price"),
-                    "market_value": pos.get("market_value"),
-                    "day_gain": pos.get("day_gain"),
-                    "total_gain": pos.get("total_gain"),
-                    "total_gain_percent": pos.get("total_gain_percent"),
-                }
+            # Use account_id_key as the stable identifier
+            account_id = hashlib.md5(
+                f"etrade_{account_id_key}".encode()
+            ).hexdigest()[:16]
+
+            # --- Get balance ---
+            balance = 0.0
+            day_change = None
+            day_change_pct = None
+            try:
+                bal_resp = accounts_api.get_account_balance(
+                    account_id_key=account_id_key,
+                    real_time=True,
+                    resp_format="json",
+                )
+                bal = bal_resp.get("BalanceResponse", {})
+                computed = bal.get("Computed", {})
+                rt = computed.get("RealTimeValues", {})
+                balance = float(rt.get("totalAccountValue", 0))
+                # Day change from real-time values
+                day_change = float(rt.get("netMv", 0)) if rt.get("netMv") else None
+                day_change_pct = float(rt.get("netMvPct", 0)) if rt.get("netMvPct") else None
+            except Exception as e:
+                print(f"   Balance error for {account_name}: {e}", file=sys.stderr)
+
+            print(
+                f"   {account_name} ({account_type}): ${balance:,.2f}",
+                file=sys.stderr,
             )
+
+            account_results.append({
+                "account_id": account_id,
+                "account_name": account_name,
+                "account_type": account_type,
+                "balance": balance,
+                "day_change": day_change,
+                "day_change_percent": day_change_pct,
+            })
+
+            # --- Get positions ---
+            try:
+                port_resp = accounts_api.get_account_portfolio(
+                    account_id_key=account_id_key,
+                    resp_format="json",
+                )
+                portfolios = _ensure_list(
+                    port_resp.get("PortfolioResponse", {}).get("AccountPortfolio", [])
+                )
+                for portfolio in portfolios:
+                    for pos in _ensure_list(portfolio.get("Position", [])):
+                        symbol = (
+                            pos.get("Product", {}).get("symbol", "")
+                            or pos.get("symbolDescription", "")
+                        )
+                        if not symbol:
+                            continue
+
+                        quantity = float(pos.get("quantity", 0))
+                        market_value = float(pos.get("marketValue", 0))
+                        total_gain = float(pos.get("totalGain", 0))
+                        day_gain = float(pos.get("daysGain", 0))
+                        price_paid = float(pos.get("pricePaid", 0))
+
+                        quick = pos.get("Quick", {})
+                        last_price = float(quick.get("lastTrade", 0))
+
+                        cost_basis = market_value - total_gain
+                        total_gain_pct = (
+                            (total_gain / cost_basis * 100) if cost_basis != 0 else 0.0
+                        )
+
+                        position_id = hashlib.md5(
+                            f"{account_id}_{symbol}".encode()
+                        ).hexdigest()[:16]
+
+                        all_positions.append({
+                            "position_id": position_id,
+                            "account_id": account_id,
+                            "symbol": symbol,
+                            "description": pos.get("symbolDescription"),
+                            "quantity": quantity,
+                            "last_price": last_price,
+                            "price_paid": price_paid,
+                            "market_value": market_value,
+                            "day_gain": day_gain,
+                            "total_gain": total_gain,
+                            "total_gain_percent": total_gain_pct,
+                        })
+            except Exception as e:
+                print(f"   Positions error for {account_name}: {e}", file=sys.stderr)
+
+            # --- Get transactions (last 30 days) ---
+            try:
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=30)
+                txn_resp = accounts_api.list_transactions(
+                    account_id_key=account_id_key,
+                    start_date=start_date,
+                    end_date=end_date,
+                    count=50,
+                    resp_format="json",
+                )
+                raw_txns = _ensure_list(
+                    txn_resp.get("TransactionListResponse", {})
+                    .get("Transaction", [])
+                )
+                for txn in raw_txns:
+                    txn_id = str(txn.get("transactionId", ""))
+                    brokerage = txn.get("brokerage", {})
+
+                    # Product info may be nested
+                    product = brokerage.get("product", [])
+                    symbol = ""
+                    qty = 0.0
+                    price = 0.0
+                    if product:
+                        first = product[0] if isinstance(product, list) else product
+                        symbol = first.get("symbol", "")
+                        qty = float(first.get("quantity", 0))
+                        price = float(first.get("price", 0))
+
+                    all_transactions.append({
+                        "transaction_id": txn_id,
+                        "account_id": account_id,
+                        "date": txn.get("transactionDate"),
+                        "type": txn.get("transactionType", ""),
+                        "description": brokerage.get("displaySymbol", txn.get("description", "")),
+                        "symbol": symbol,
+                        "quantity": qty,
+                        "price": price,
+                        "amount": float(txn.get("amount", 0)),
+                    })
+            except Exception as e:
+                # Transactions may not be available for all account types
+                logger.debug("Transactions error for %s: %s", account_name, e)
+
+        print(
+            f"   Found {len(account_results)} accounts, "
+            f"{len(all_positions)} positions, "
+            f"{len(all_transactions)} transactions",
+            file=sys.stderr,
+        )
 
         return {
             "status": "ok",
             "source": "etrade",
             "accounts": account_results,
-            "transactions": [],
-            "positions": position_results,
+            "transactions": all_transactions,
+            "positions": all_positions,
             "balance_history": [],
         }
 
-    # ── API response parsers ────────────────────────────────────────────
-
-    def _parse_accounts_from_api(self, data) -> list[dict]:
-        """Parse accounts from E*Trade's internal API response."""
-        accounts = []
-
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            # Try common keys for account arrays
-            for key in [
-                "Accounts",
-                "accounts",
-                "AccountList",
-                "accountList",
-                "Items",
-                "items",
-                "AccountListResponse",
-            ]:
-                if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
-            # Check nested structures
-            if not items:
-                for val in data.values():
-                    if isinstance(val, list) and len(val) > 0:
-                        if isinstance(val[0], dict) and any(
-                            k in val[0]
-                            for k in [
-                                "AccountNumber",
-                                "accountNumber",
-                                "accountId",
-                                "AccountId",
-                                "accountIdKey",
-                                "Balance",
-                                "balance",
-                                "netAccountValue",
-                            ]
-                        ):
-                            items = val
-                            break
-                    # E*Trade often nests: data -> key -> AccountListResponse -> Accounts
-                    if isinstance(val, dict):
-                        for inner in val.values():
-                            if isinstance(inner, list):
-                                items = inner
-                                break
-                            if isinstance(inner, dict):
-                                for deeper in inner.values():
-                                    if isinstance(deeper, list):
-                                        items = deeper
-                                        break
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            name = (
-                item.get("accountName")
-                or item.get("AccountName")
-                or item.get("accountDesc")
-                or item.get("AccountDesc")
-                or item.get("displayName")
-                or item.get("DisplayName")
-                or item.get("institutionType")
-                or ""
-            )
-            balance = (
-                item.get("netAccountValue")
-                or item.get("NetAccountValue")
-                or item.get("accountValue")
-                or item.get("AccountValue")
-                or item.get("totalMarketValue")
-                or item.get("balance")
-                or item.get("Balance")
-                or 0
-            )
-            acct_num = (
-                item.get("accountId")
-                or item.get("AccountId")
-                or item.get("accountNumber")
-                or item.get("AccountNumber")
-                or item.get("accountIdKey")
-                or ""
-            )
-            day_change = item.get("dayChange") or item.get("DayChange") or item.get("todaysGainLoss")
-            day_change_pct = item.get("dayChangePercent") or item.get("DayChangePercent") or item.get("todaysGainLossPct")
-
-            if isinstance(balance, str):
-                try:
-                    balance = float(balance.replace(",", "").replace("$", ""))
-                except ValueError:
-                    balance = 0
-
-            suffix = str(acct_num)[-4:] if acct_num else ""
-            acct_type = self._infer_type(
-                item.get("accountType", "") or item.get("AccountType", "") or name
-            )
-
-            if name:
-                print(
-                    f"   API: {name} ...{suffix}: ${balance:,.2f} ({acct_type})",
-                    file=sys.stderr,
-                )
-                accounts.append(
-                    {
-                        "name": name,
-                        "balance": float(balance) if balance else 0.0,
-                        "type": acct_type,
-                        "account_suffix": suffix,
-                        "day_change": day_change,
-                        "day_change_percent": day_change_pct,
-                    }
-                )
-
-        return accounts
-
-    def _parse_positions_from_api(self, data, accounts: list[dict]) -> list[dict]:
-        """Parse positions from E*Trade's internal API response."""
-        positions = []
-
-        # Determine default account_id from first account
-        default_account_id = ""
-        default_account_name = ""
-        if accounts:
-            suffix = accounts[0].get("account_suffix", "")
-            id_key = f"etrade_{suffix}" if suffix else accounts[0]["name"]
-            default_account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
-            default_account_name = accounts[0]["name"]
-
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            for key in [
-                "positions",
-                "Positions",
-                "PositionList",
-                "positionList",
-                "Items",
-                "items",
-            ]:
-                if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
-            # Nested: PortfolioResponse -> AccountPortfolio -> Position
-            if not items:
-                for val in data.values():
-                    if isinstance(val, dict):
-                        for inner in val.values():
-                            if isinstance(inner, list):
-                                # Could be list of account portfolios
-                                for entry in inner:
-                                    if isinstance(entry, dict):
-                                        for pk in ["Position", "position", "positions"]:
-                                            if pk in entry and isinstance(entry[pk], list):
-                                                items.extend(entry[pk])
-                                if not items:
-                                    items = inner
-                                break
-                    elif isinstance(val, list):
-                        items = val
-                        break
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            symbol = (
-                item.get("symbol")
-                or item.get("Symbol")
-                or item.get("symbolDescription")
-                or ""
-            )
-            # E*Trade sometimes nests: Product -> symbol
-            if not symbol and "Product" in item:
-                product = item["Product"]
-                if isinstance(product, dict):
-                    symbol = product.get("symbol") or product.get("Symbol") or ""
-            if not symbol and "product" in item:
-                product = item["product"]
-                if isinstance(product, dict):
-                    symbol = product.get("symbol") or product.get("Symbol") or ""
-
-            if not symbol:
-                continue
-
-            quantity = (
-                item.get("quantity")
-                or item.get("Quantity")
-                or item.get("qty")
-                or item.get("positionQty")
-                or 0
-            )
-            market_value = (
-                item.get("marketValue")
-                or item.get("MarketValue")
-                or item.get("totalMarketValue")
-                or item.get("currentValue")
-                or 0
-            )
-            last_price = (
-                item.get("lastTrade")
-                or item.get("LastTrade")
-                or item.get("lastPrice")
-                or item.get("LastPrice")
-                or item.get("currentPrice")
-                or 0
-            )
-            # Quick -> lastTrade for E*Trade
-            if not last_price and "Quick" in item:
-                quick = item["Quick"]
-                if isinstance(quick, dict):
-                    last_price = quick.get("lastTrade") or quick.get("lastPrice") or 0
-
-            day_gain = (
-                item.get("daysGain")
-                or item.get("DaysGain")
-                or item.get("dayGain")
-                or item.get("todaysGainLoss")
-                or 0
-            )
-            total_gain = (
-                item.get("totalGain")
-                or item.get("TotalGain")
-                or item.get("totalGainLoss")
-                or 0
-            )
-            total_gain_pct = (
-                item.get("totalGainPct")
-                or item.get("TotalGainPct")
-                or item.get("totalGainLossPct")
-                or 0
-            )
-            description = (
-                item.get("symbolDescription")
-                or item.get("description")
-                or item.get("Description")
-            )
-
-            if isinstance(market_value, str):
-                try:
-                    market_value = float(market_value.replace(",", "").replace("$", ""))
-                except ValueError:
-                    market_value = 0
-
-            account_id = default_account_id
-            account_name = default_account_name
-
-            position_id = hashlib.md5(
-                f"{account_id}_{symbol}".encode()
-            ).hexdigest()[:16]
-
-            positions.append(
-                {
-                    "position_id": position_id,
-                    "account_id": account_id,
-                    "account_name": account_name,
-                    "symbol": symbol,
-                    "description": description,
-                    "quantity": float(quantity) if quantity else None,
-                    "last_price": float(last_price) if last_price else None,
-                    "market_value": float(market_value) if market_value else None,
-                    "day_gain": float(day_gain) if day_gain else None,
-                    "total_gain": float(total_gain) if total_gain else None,
-                    "total_gain_percent": (
-                        float(total_gain_pct) if total_gain_pct else None
-                    ),
-                }
-            )
-
-        return positions
-
-    # ── DOM fallback extractors ─────────────────────────────────────────
-
-    async def _extract_accounts_dom(self, page) -> list[dict]:
-        """Fallback: extract accounts from DOM elements."""
-        accounts = []
-
-        selectors = [
-            'div[class*="Account---account"]',
-            'div[class*="AccountCardView"]',
-            'div[class*="account-card"]',
-            '[data-testid*="account"]',
-        ]
-
-        account_cards = []
-        for selector in selectors:
-            account_cards = await page.query_selector_all(selector)
-            if account_cards:
-                print(
-                    f"   Found {len(account_cards)} cards with: {selector}",
-                    file=sys.stderr,
-                )
-                break
-
-        for card in account_cards:
-            try:
-                text = await card.inner_text()
-                lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-                if not lines:
-                    continue
-
-                name = lines[0]
-
-                # Look for account suffix
-                for line in lines:
-                    match = re.search(
-                        r"(?:ending with|ending in|\.{3}|-)(\d{4})\b",
-                        line,
-                        re.IGNORECASE,
-                    )
-                    if match and match.group(1) not in name:
-                        name = f"{name} - {match.group(1)}"
-                        break
-
-                net_value = None
-                day_gain = None
-                day_gain_percent = None
-
-                for i, line in enumerate(lines):
-                    line_lower = line.lower()
-                    next_line = lines[i + 1] if i + 1 < len(lines) else ""
-
-                    if "net account value" in line_lower:
-                        net_value = self._parse_dollar(line) or self._parse_dollar(
-                            next_line
-                        )
-                    elif (
-                        "day's gain" in line_lower or "days gain" in line_lower
-                    ):
-                        day_gain = self._parse_dollar(line) or self._parse_dollar(
-                            next_line
-                        )
-                        day_gain_percent = self._parse_percent(
-                            line
-                        ) or self._parse_percent(next_line)
-
-                # Fallback: first dollar amount on the card
-                if net_value is None:
-                    for line in lines:
-                        if "$" in line:
-                            net_value = self._parse_dollar(line)
-                            if net_value:
-                                break
-
-                if net_value and net_value > 0:
-                    # Extract suffix for filtering
-                    suffix = ""
-                    suffix_match = re.search(r"(\d{4})\s*$", name)
-                    if suffix_match:
-                        suffix = suffix_match.group(1)
-
-                    accounts.append(
-                        {
-                            "name": name,
-                            "balance": net_value,
-                            "type": "brokerage",
-                            "account_suffix": suffix,
-                            "day_change": day_gain,
-                            "day_change_percent": day_gain_percent,
-                        }
-                    )
-
-            except Exception as e:
-                print(f"   Error parsing account card: {e}", file=sys.stderr)
-
-        return accounts
-
-    def _parse_positions_from_text(
-        self, content: str, account_id: str, account_name: str
-    ) -> list[dict]:
-        """Fallback: parse positions from page text using regex heuristics."""
-        positions = []
-        lines = content.split("\n")
-
-        skip_symbols = {
-            "CASH", "TOTAL", "DAY", "GAIN", "LOSS", "BUY", "SELL", "TYPE",
-            "LAST", "PRICE", "QTY", "VALUE", "TRADE", "ACTIONS", "SYMBOL",
-            "NET", "IRA", "ROTH", "SEP", "HSA", "PLAN", "ESPP", "RSU", "TRAD",
-        }
-
-        for i, line in enumerate(lines):
-            line = line.strip()
-            symbol_match = re.match(r"^([A-Z]{1,5})(?:\s|$|\()", line)
-            if not symbol_match:
-                continue
-
-            symbol = symbol_match.group(1)
-            if symbol in skip_symbols:
-                continue
-
-            context = "\n".join(lines[i : min(len(lines), i + 15)])
-            symbol_pos = context.find(symbol)
-            after = context[symbol_pos + len(symbol) :] if symbol_pos >= 0 else context
-
-            all_numbers = re.findall(r"([\d,]+\.?\d*)", after)
-            all_numbers = [
-                float(n.replace(",", ""))
-                for n in all_numbers
-                if n and float(n.replace(",", "")) > 0
-            ]
-            all_percents = [
-                float(p) for p in re.findall(r"([\d.]+)%", after) if p
-            ]
-
-            if len(all_numbers) < 3:
-                continue
-
-            market_value = None
-            last_price = None
-            quantity = None
-
-            percent_set = set(all_percents)
-            main_numbers = [n for n in all_numbers if n not in percent_set]
-
-            if len(main_numbers) >= 7:
-                last_price = main_numbers[0] if main_numbers[0] < 5000 else None
-                quantity = main_numbers[2] if len(main_numbers) > 2 else None
-                market_value = main_numbers[6] if len(main_numbers) > 6 else None
-            else:
-                large = [n for n in all_numbers if n > 10000]
-                if large:
-                    market_value = max(large)
-                prices = [n for n in all_numbers if 10 < n < 2000]
-                if prices:
-                    last_price = prices[0]
-                if market_value and last_price and last_price > 0:
-                    quantity = market_value / last_price
-
-            if market_value and market_value > 100:
-                position_id = hashlib.md5(
-                    f"{account_id}_{symbol}".encode()
-                ).hexdigest()[:16]
-                positions.append(
-                    {
-                        "position_id": position_id,
-                        "account_id": account_id,
-                        "account_name": account_name,
-                        "symbol": symbol,
-                        "description": None,
-                        "quantity": quantity,
-                        "last_price": last_price,
-                        "market_value": market_value,
-                        "day_gain": None,
-                        "total_gain": None,
-                        "total_gain_percent": (
-                            all_percents[-1] if all_percents else None
-                        ),
-                    }
-                )
-
-        # Cash position
-        for j, line in enumerate(lines):
-            if line.strip().lower() in ("cash", "cash "):
-                for k in range(j, min(j + 5, len(lines))):
-                    m = re.search(r"\$?([\d,]+\.?\d*)", lines[k])
-                    if m:
-                        val = float(m.group(1).replace(",", ""))
-                        if val > 0:
-                            positions.append(
-                                {
-                                    "position_id": hashlib.md5(
-                                        f"{account_id}_CASH".encode()
-                                    ).hexdigest()[:16],
-                                    "account_id": account_id,
-                                    "account_name": account_name,
-                                    "symbol": "CASH",
-                                    "description": "Cash & Sweep Vehicle",
-                                    "quantity": None,
-                                    "last_price": None,
-                                    "market_value": val,
-                                    "day_gain": 0,
-                                    "total_gain": 0,
-                                    "total_gain_percent": 0,
-                                }
-                            )
-                            break
-                break
-
-        return positions
-
-    # ── Helpers ──────────────────────────────────────────────────────────
-
     @staticmethod
-    def _parse_dollar(text: str):
-        match = re.search(r"([+-])?\$?([\d,]+\.?\d*)", text)
-        if match:
-            sign = match.group(1) or ""
-            amount = float(match.group(2).replace(",", ""))
-            return -amount if sign == "-" else amount
-        return None
-
-    @staticmethod
-    def _parse_percent(text: str):
-        match = re.search(r"([+-]?\d+\.?\d*)%", text)
-        return float(match.group(1)) if match else None
-
-    @staticmethod
-    def _infer_type(text: str) -> str:
-        t = text.lower()
-        if "checking" in t:
-            return "checking"
-        if "saving" in t:
-            return "savings"
+    def _map_account_type(acct_type: str, inst_type: str, name: str) -> str:
+        """Map E*Trade account type strings to standard types."""
+        t = (acct_type + " " + name).lower()
         if "401" in t:
             return "401k"
         if any(w in t for w in ["ira", "roth", "retirement"]):
             return "ira"
-        if any(w in t for w in ["brokerage", "individual"]):
-            return "brokerage"
+        if "checking" in t:
+            return "checking"
+        if "saving" in t:
+            return "savings"
         return "brokerage"

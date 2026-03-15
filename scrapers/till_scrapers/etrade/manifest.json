@@ -2,7 +2,8 @@
   "name": "etrade",
   "display_name": "E*Trade",
   "account_types": ["brokerage", "ira", "401k"],
-  "provides": ["accounts", "positions", "balances"],
+  "provides": ["accounts", "positions", "balances", "transactions"],
   "requires_headful": false,
+  "auth_method": "oauth_api",
   "config_schema": {}
 }
