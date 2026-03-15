@@ -17,16 +17,16 @@ class SchwabScraper(BaseScraper):
         super().__init__(headless=False)
 
         self.transaction_account = os.environ.get("TILL_SCHWAB_TRANSACTION_ACCOUNT", "")
-        account_types = os.environ.get("TILL_SCHWAB_ACCOUNT_TYPES", "Bank,Investment")
-        self.allowed_account_types = [t.strip() for t in account_types.split(",")]
+
+        # Only include accounts matching these suffixes (empty = include all)
+        include_str = os.environ.get("TILL_SCHWAB_INCLUDE_ACCOUNTS", "")
+        self.include_accounts = [s.strip() for s in include_str.split(",") if s.strip()] if include_str else []
 
     async def navigate_and_login(self, page, username: str, password: str):
-        # Navigate directly to the client login page (has the iframe login form)
         login_url = "https://client.schwab.com/Login/SignOn/CustomerCenterLogin.aspx"
         print(f"   Navigating to {login_url}", file=sys.stderr)
         await page.goto(login_url, wait_until="domcontentloaded", timeout=300000)
 
-        # Check if we're already logged in (redirected to summary)
         if "client.schwab.com/app/accounts" in page.url:
             print("   Already logged in (session active)", file=sys.stderr)
             return
@@ -36,7 +36,7 @@ class SchwabScraper(BaseScraper):
             try:
                 await page.wait_for_timeout(1000)
 
-                # Login form is inside an iframe with title "log in form" or id "lmsIframe"
+                # Login form is inside an iframe
                 frame = None
                 for selector in [
                     'iframe[title="log in form"]',
@@ -45,7 +45,6 @@ class SchwabScraper(BaseScraper):
                 ]:
                     try:
                         frame = page.frame_locator(selector)
-                        # Test if frame is accessible by looking for any input
                         await frame.locator('input').first.wait_for(timeout=3000)
                         print(f"   Found login iframe: {selector}", file=sys.stderr)
                         break
@@ -54,7 +53,6 @@ class SchwabScraper(BaseScraper):
                         continue
 
                 if frame is None:
-                    # No iframe — try directly on page
                     print("   No iframe found, trying direct page login", file=sys.stderr)
                     await page.locator('#loginIdInput').click()
                     await page.locator('#loginIdInput').fill("")
@@ -65,7 +63,6 @@ class SchwabScraper(BaseScraper):
                     await page.wait_for_timeout(300)
                     await page.click('#btnLogin')
                 else:
-                    # Fill username — use type() with delay to simulate human input
                     print("   Entering username...", file=sys.stderr)
                     try:
                         username_field = frame.get_by_role("textbox", name="Login ID")
@@ -79,7 +76,6 @@ class SchwabScraper(BaseScraper):
                         await login_input.type(username, delay=50)
                     await page.wait_for_timeout(500)
 
-                    # Fill password
                     print("   Entering password...", file=sys.stderr)
                     try:
                         password_field = frame.get_by_role("textbox", name="Password")
@@ -91,7 +87,6 @@ class SchwabScraper(BaseScraper):
                         await pw_input.type(password, delay=30)
                     await page.wait_for_timeout(500)
 
-                    # Click login
                     print("   Clicking login...", file=sys.stderr)
                     try:
                         login_button = frame.get_by_role("button", name="Log in")
@@ -99,29 +94,21 @@ class SchwabScraper(BaseScraper):
                     except Exception:
                         await frame.locator('#btnLogin').click()
 
-                # Wait for redirect — could go to summary, 2FA, or security challenge
                 print("   Waiting for login to complete...", file=sys.stderr)
                 try:
-                    await page.wait_for_url(
-                        "**/client.schwab.com/**",
-                        timeout=120000,
-                    )
+                    await page.wait_for_url("**/client.schwab.com/**", timeout=120000)
                 except Exception:
-                    pass  # May need 2FA — continue and check URL below
+                    pass
 
-                # Check if we landed on 2FA or security challenge
                 current_url = page.url
                 if "client.schwab.com/app/accounts" in current_url:
                     print("   Login successful!", file=sys.stderr)
                 else:
                     print(f"   Post-login page: {current_url}", file=sys.stderr)
-                    print("   Waiting 60s for 2FA/security challenge...", file=sys.stderr)
+                    print("   Waiting for 2FA/security challenge...", file=sys.stderr)
                     await page.screenshot(path="/tmp/till_schwab_2fa.png")
                     try:
-                        await page.wait_for_url(
-                            "**/app/accounts/**",
-                            timeout=120000,
-                        )
+                        await page.wait_for_url("**/app/accounts/**", timeout=120000)
                         print("   Login successful after 2FA!", file=sys.stderr)
                     except Exception:
                         await page.screenshot(path="/tmp/till_schwab_login.png")
@@ -143,25 +130,41 @@ class SchwabScraper(BaseScraper):
         await page.wait_for_timeout(3000)
 
     async def extract(self, page) -> dict:
-        accounts = []
-        transactions = []
-
         await page.screenshot(path="/tmp/till_schwab_accounts.png")
         print("   Screenshot: /tmp/till_schwab_accounts.png", file=sys.stderr)
 
         # Extract accounts
-        accounts = await self._extract_accounts(page)
+        all_accounts = await self._extract_accounts(page)
+
+        # Filter by include_accounts if configured
+        if self.include_accounts:
+            accounts = [a for a in all_accounts if a.get("account_suffix") in self.include_accounts]
+            skipped = len(all_accounts) - len(accounts)
+            if skipped:
+                print(f"   Filtered to {len(accounts)} accounts (skipped {skipped} not in include_accounts)", file=sys.stderr)
+        else:
+            accounts = all_accounts
+
         print(f"   Found {len(accounts)} accounts", file=sys.stderr)
 
-        # Extract transactions if configured
+        # Extract transactions for configured account
+        transactions = []
         if self.transaction_account:
-            transactions = await self._extract_transactions(page)
-            print(f"   Found {len(transactions)} transactions", file=sys.stderr)
+            # Find the account_id for the transaction account
+            txn_acct = next(
+                (a for a in accounts if a.get("account_suffix") == self.transaction_account),
+                None
+            )
+            if txn_acct:
+                acct_id = hashlib.md5(f"schwab_{self.transaction_account}".encode()).hexdigest()[:16]
+                transactions = await self._extract_transactions(page, acct_id)
+                print(f"   Found {len(transactions)} transactions for ...{self.transaction_account}", file=sys.stderr)
+            else:
+                print(f"   Transaction account ...{self.transaction_account} not in filtered accounts", file=sys.stderr)
 
-        # Build account results
+        # Build results
         account_results = []
         for acct in accounts:
-            # Use account suffix for stable ID when available
             suffix = acct.get("account_suffix", "")
             id_key = f"schwab_{suffix}" if suffix else acct["name"]
             account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
@@ -174,14 +177,11 @@ class SchwabScraper(BaseScraper):
                 "day_change_percent": acct.get("day_change_percent"),
             })
 
-        # Build transaction results
         txn_results = []
         for txn in transactions:
             txn_results.append({
-                "txn_id": txn.get("id", hashlib.md5(
-                    f"{txn['date']}:{txn['description']}:{txn['amount']}".encode()
-                ).hexdigest()[:16]),
-                "account_id": txn.get("account_id", ""),
+                "txn_id": txn["id"],
+                "account_id": txn["account_id"],
                 "date": txn["date"],
                 "description": txn["description"],
                 "amount": txn["amount"],
@@ -199,16 +199,9 @@ class SchwabScraper(BaseScraper):
         }
 
     async def _extract_accounts(self, page) -> list[dict]:
-        """Extract Schwab accounts from the summary page.
-
-        Real accounts have a sr-only span with "Account number ending in XXX".
-        Group headers and total rows do not. We use this to filter.
-
-        Columns: Account Name | Type | Cash & Cash Investments | Account Value | Day Change $ | Day Change %
-        """
+        """Extract accounts. Only real accounts with 'Account number ending in' are included."""
         accounts = []
 
-        # Target the Accounts section wrapper
         accounts_wrapper = await page.query_selector('div.allAccountsWrapper')
         if not accounts_wrapper:
             accounts_wrapper = await page.query_selector(
@@ -217,19 +210,16 @@ class SchwabScraper(BaseScraper):
 
         search_context = accounts_wrapper or page
 
-        # Get all table rows
         account_rows = await search_context.query_selector_all(
             'sdps-table-row, table tbody tr, [class*="AccountRow"]'
         )
 
         for row in account_rows:
             try:
-                # Skip group headers (they have account-list-table-group-header attribute)
                 is_header = await row.get_attribute('account-list-table-group-header')
                 if is_header is not None:
                     continue
 
-                # Only include rows with "Account number ending in" — these are real accounts
                 account_num_el = await row.query_selector('span.sr-only')
                 account_suffix = None
                 if account_num_el:
@@ -239,10 +229,8 @@ class SchwabScraper(BaseScraper):
                         account_suffix = match.group(1)
 
                 if account_suffix is None:
-                    # No account number = total/header row, skip
                     continue
 
-                # Get account name from the first cell
                 cells = await row.query_selector_all('sdps-table-cell, td')
                 if len(cells) < 4:
                     continue
@@ -252,24 +240,16 @@ class SchwabScraper(BaseScraper):
                     text = await cell.inner_text()
                     cell_texts.append(text.strip())
 
-                # First cell contains: "Account Name\nCompanyName\n..."
                 raw_name = cell_texts[0]
-                # Extract just the account name (first line, before company name)
                 name_lines = [l.strip() for l in raw_name.split('\n') if l.strip()]
                 name = name_lines[0] if name_lines else raw_name
-
-                # Clean up name
                 name = name.rstrip('\u2020').strip()
                 if not name or 'Total' in name:
                     continue
 
-                # Extract account type
-                # Check Type column (cell index 1) — can be multi-line:
-                # "Schwab Bank\nType\nChecking" or just "Brokerage"
+                # Detect account type
                 account_type = "other"
                 type_text = cell_texts[1] if len(cell_texts) > 1 else ""
-                # Also check the full row text for type keywords
-                full_text = " ".join(cell_texts).lower()
                 type_lines = [l.strip().lower() for l in type_text.split('\n') if l.strip()]
                 for tl in type_lines:
                     if tl in ['checking']:
@@ -285,23 +265,19 @@ class SchwabScraper(BaseScraper):
                         account_type = "ira"
                         break
 
-                # Infer from name if type column didn't help
                 if account_type == "other":
                     name_lower = name.lower()
                     if 'checking' in name_lower:
                         account_type = "checking"
                     elif 'saving' in name_lower:
                         account_type = "savings"
-                    elif '401' in name_lower or '401(k)' in name_lower:
+                    elif '401' in name_lower:
                         account_type = "401k"
-                    elif 'ira' in name_lower or 'roth' in name_lower or 'retirement' in name_lower:
+                    elif any(w in name_lower for w in ['ira', 'roth', 'retirement']):
                         account_type = "ira"
-                    elif '529' in name_lower:
-                        account_type = "brokerage"
-                    elif 'etrade' in name_lower or 'individual' in name_lower:
+                    elif any(w in name_lower for w in ['529', 'etrade', 'individual']):
                         account_type = "brokerage"
 
-                # Parse dollar values from remaining cells
                 account_value = None
                 day_change = None
                 day_change_percent = None
@@ -313,7 +289,6 @@ class SchwabScraper(BaseScraper):
                         amount = float(dollar_match.group(2).replace(',', ''))
                         if sign == '-':
                             amount = -amount
-                        # Columns: Type(1), Cash(2), Value(3), Day$(4)
                         if i == 3:
                             account_value = amount
                         elif i == 4:
@@ -345,34 +320,143 @@ class SchwabScraper(BaseScraper):
 
         return accounts
 
-    async def _extract_transactions(self, page) -> list[dict]:
-        """Extract recent transactions."""
+    async def _extract_transactions(self, page, account_id: str) -> list[dict]:
+        """Extract transactions from Schwab transaction history.
+
+        Columns: Date | Type | Check Number | Description | Withdrawal | Deposit | Running Balance
+        """
         transactions = []
 
         try:
-            history_url = f"https://client.schwab.com/app/accounts/transactionhistory/#/history/{self.transaction_account}"
+            history_url = "https://client.schwab.com/app/accounts/history/#/"
+            print(f"   Navigating to transaction history...", file=sys.stderr)
             await page.goto(history_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(5000)
 
+            # Try to select the right account via dropdown
+            if self.transaction_account:
+                await self._select_account_dropdown(page, self.transaction_account)
+
+            # Wait for the Schwab table
+            try:
+                await page.wait_for_selector('table.sdps-table', timeout=15000)
+            except Exception:
+                print("   Transaction table not found", file=sys.stderr)
+
+            await page.wait_for_timeout(2000)
+
+            # Scroll to load more content
+            for _ in range(3):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1000)
+
+            # Click "Show More" buttons to load all transactions
+            for attempt in range(10):
+                clicked = False
+                for selector in [
+                    'button:has-text("Show More")',
+                    'button:has-text("Load More")',
+                    'button:has-text("Show more")',
+                    '[class*="show-more"]',
+                    '[class*="load-more"]',
+                ]:
+                    btn = await page.query_selector(selector)
+                    if btn:
+                        is_visible = await btn.is_visible()
+                        if is_visible:
+                            print(f"   Loading more transactions (page {attempt + 1})...", file=sys.stderr)
+                            await btn.click()
+                            await page.wait_for_timeout(2000)
+                            clicked = True
+                            break
+                if not clicked:
+                    break
+
             await page.screenshot(path="/tmp/till_schwab_transactions.png")
 
-            rows = await page.query_selector_all('tr[class*="transaction"], tr[data-testid*="transaction"]')
-            for row in rows:
+            # Find transaction rows
+            txn_rows = []
+            for selector in [
+                'table.sdps-table tbody tr',
+                'table[class*="sdps-table"] tbody tr',
+                '.sdps-table tbody tr',
+                'table tbody tr',
+            ]:
+                txn_rows = await page.query_selector_all(selector)
+                if txn_rows:
+                    break
+
+            print(f"   Found {len(txn_rows)} transaction rows", file=sys.stderr)
+
+            for row in txn_rows:
                 try:
-                    text = await row.inner_text()
-                    lines = [l.strip() for l in text.split("\t") if l.strip()]
-                    if len(lines) >= 3:
-                        date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', lines[0])
-                        amount_match = re.search(r'\$?([\d,]+\.?\d*)', lines[-1])
-                        if date_match and amount_match:
-                            transactions.append({
-                                "date": date_match.group(1),
-                                "description": lines[1] if len(lines) > 1 else "Unknown",
-                                "amount": float(amount_match.group(1).replace(',', '')),
-                                "account_id": hashlib.md5(
-                                    self.transaction_account.encode()
-                                ).hexdigest()[:16],
-                            })
+                    cells = await row.query_selector_all('td')
+                    if len(cells) < 5:
+                        continue
+
+                    cell_texts = []
+                    for cell in cells:
+                        text = await cell.inner_text()
+                        cell_texts.append(text.strip())
+
+                    # Parse columns based on count
+                    if len(cell_texts) >= 7:
+                        date_str, txn_type, check_num, description, withdrawal, deposit, balance = cell_texts[:7]
+                    elif len(cell_texts) >= 5:
+                        date_str = cell_texts[0]
+                        description = cell_texts[1]
+                        withdrawal = cell_texts[2]
+                        deposit = cell_texts[3]
+                        balance = cell_texts[4]
+                        txn_type = ""
+                        check_num = ""
+                    else:
+                        continue
+
+                    # Skip header rows
+                    if 'DATE' in date_str.upper() or 'POSTED' in date_str.upper():
+                        continue
+
+                    # Parse date
+                    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', date_str)
+                    if not date_match:
+                        continue
+                    raw_date = date_match.group(1)
+                    parts = raw_date.split('/')
+                    if len(parts) != 3:
+                        continue
+                    month, day, year = parts
+                    if len(year) == 2:
+                        year = '20' + year
+                    date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+
+                    # Parse amounts
+                    withdrawal_amt = self._parse_amount(withdrawal)
+                    deposit_amt = self._parse_amount(deposit)
+
+                    amount = 0.0
+                    if withdrawal_amt:
+                        amount = -withdrawal_amt
+                    elif deposit_amt:
+                        amount = deposit_amt
+
+                    if amount == 0.0:
+                        continue
+
+                    txn_id = hashlib.md5(
+                        f"{date}_{description}_{amount}".encode()
+                    ).hexdigest()[:16]
+
+                    transactions.append({
+                        "id": txn_id,
+                        "account_id": account_id,
+                        "date": date,
+                        "description": description.strip(),
+                        "amount": amount,
+                        "category": self._infer_category(description),
+                        "status": "posted",
+                    })
+
                 except Exception:
                     continue
 
@@ -380,3 +464,63 @@ class SchwabScraper(BaseScraper):
             print(f"   Error extracting transactions: {e}", file=sys.stderr)
 
         return transactions
+
+    async def _select_account_dropdown(self, page, account_suffix: str):
+        """Try to select a specific account in the transaction history dropdown."""
+        try:
+            dropdown_selectors = [
+                f'button:has-text("...{account_suffix}")',
+                f'button:has-text("{account_suffix}")',
+                '[class*="account-selector"] button',
+                '[aria-haspopup="listbox"]',
+            ]
+
+            for selector in dropdown_selectors:
+                elem = await page.query_selector(selector)
+                if elem and await elem.is_visible():
+                    text = await elem.inner_text()
+                    print(f"   Found account dropdown: {text[:40]}...", file=sys.stderr)
+                    await elem.click()
+                    await page.wait_for_timeout(2000)
+
+                    # Find and click the target account in the dropdown
+                    for tag in ['li', 'option', 'a', 'div[role="option"]']:
+                        options = await page.query_selector_all(tag)
+                        for opt in options:
+                            opt_text = await opt.inner_text()
+                            if account_suffix in opt_text and await opt.is_visible():
+                                if 'TRANSFER' not in opt_text.upper():
+                                    print(f"   Selected account: {opt_text[:60]}...", file=sys.stderr)
+                                    await opt.click()
+                                    await page.wait_for_timeout(3000)
+                                    return
+                    break
+        except Exception as e:
+            print(f"   Could not select account dropdown: {e}", file=sys.stderr)
+
+    @staticmethod
+    def _parse_amount(text: str) -> float | None:
+        if not text or not text.strip():
+            return None
+        clean = re.sub(r'[^\d,.\-]', '', text)
+        if not clean or clean in ['-', '', '.']:
+            return None
+        try:
+            return abs(float(clean.replace(',', '')))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _infer_category(description: str) -> str:
+        desc = description.upper()
+        if any(w in desc for w in ['PAYROLL', 'DIRECT DEP', 'SALARY']):
+            return "Income"
+        if any(w in desc for w in ['TRANSFER', 'XFER']):
+            return "Transfer"
+        if any(w in desc for w in ['ATM', 'WITHDRAWAL']):
+            return "ATM"
+        if any(w in desc for w in ['INTEREST', 'DIVIDEND']):
+            return "Interest"
+        if any(w in desc for w in ['CHECK']):
+            return "Check"
+        return "Other"

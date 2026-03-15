@@ -123,6 +123,9 @@ pub async fn run_scraper(
         cmd.env("TILL_PASSWORD", &password);
     }
 
+    // Pass source config extras as TILL_{SOURCE}_{KEY} env vars
+    pass_config_env(&mut cmd, source);
+
     let output = tokio::time::timeout(std::time::Duration::from_secs(600), cmd.output())
         .await
         .map_err(|_| anyhow::anyhow!("{source} scraper timed out after 10 minutes"))?
@@ -155,6 +158,32 @@ pub async fn run_scraper(
         .map_err(|e| anyhow::anyhow!("Failed to parse {source} output: {e}"))?;
 
     Ok(envelope)
+}
+
+/// Pass config extras for a source as env vars: TILL_{SOURCE}_{KEY}=value
+fn pass_config_env(cmd: &mut Command, source: &str) {
+    if let Ok(config) = crate::config::load_config() {
+        if let Some(source_config) = config.sources.get(source) {
+            let prefix = format!("TILL_{}", source.to_uppercase());
+            for (key, value) in &source_config.extra {
+                // Skip credential-related keys (handled separately)
+                if key.starts_with("op_") {
+                    continue;
+                }
+                let env_key = format!("{}_{}", prefix, key.to_uppercase());
+                let env_val = match value {
+                    toml::Value::String(s) => s.clone(),
+                    toml::Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    other => other.to_string(),
+                };
+                cmd.env(&env_key, &env_val);
+            }
+        }
+    }
 }
 
 /// Run scraper in test/replay mode.
@@ -196,6 +225,9 @@ pub async fn run_test(
         cmd.env("TILL_USERNAME", &username);
         cmd.env("TILL_PASSWORD", &password);
     }
+
+    // Pass source config extras as env vars
+    pass_config_env(&mut cmd, source);
 
     let output = tokio::time::timeout(std::time::Duration::from_secs(600), cmd.output())
         .await
