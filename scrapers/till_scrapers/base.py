@@ -33,14 +33,31 @@ class BaseScraper:
         user_data_dir.mkdir(parents=True, exist_ok=True)
         return user_data_dir
 
+    # Realistic Chrome user agent to avoid headless detection
+    _USER_AGENT = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    )
+
     def _get_launch_args(self) -> list[str]:
-        return [
+        args = [
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
-            "--start-minimized",
-            "--window-position=0,10000",
-            "--window-size=1280,720",
         ]
+        if self.headless:
+            # Extra flags to evade headless detection
+            args.extend([
+                "--disable-features=IsolateOrigins,site-per-process,HeadlessMode",
+                "--window-size=1280,720",
+            ])
+        else:
+            args.extend([
+                "--start-minimized",
+                "--window-position=0,10000",
+                "--window-size=1280,720",
+            ])
+        return args
 
     async def scrape(self, username: str | None = None, password: str | None = None) -> dict:
         """Run the scraper. Handles browser setup and teardown."""
@@ -60,6 +77,7 @@ class BaseScraper:
                 args=self._get_launch_args(),
                 accept_downloads=True,
                 bypass_csp=False,
+                user_agent=self._USER_AGENT,
             )
             page = context.pages[0] if context.pages else await context.new_page()
 

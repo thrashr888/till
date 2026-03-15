@@ -26,14 +26,27 @@ class SchwabScraper(BaseScraper):
     async def navigate_and_login(self, page, username: str, password: str):
         # Try accounts page first — session cookies may still be valid
         print("   Checking for active session...", file=sys.stderr)
-        await page.goto(
-            "https://client.schwab.com/app/accounts/summary/",
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-        await page.wait_for_timeout(2000)
+        try:
+            resp = await page.goto(
+                "https://client.schwab.com/app/accounts/summary/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            # Wait for any redirects to settle
+            await page.wait_for_timeout(3000)
+            # Also wait for network to quiet down (redirects may chain)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"   Session check navigation error: {e}", file=sys.stderr)
 
-        if "client.schwab.com/app/accounts" in page.url:
+        current_url = page.url
+        print(f"   Session check URL: {current_url}", file=sys.stderr)
+
+        # Session is valid if we stayed on the accounts page (not redirected to login)
+        if "client.schwab.com/app/accounts" in current_url and "login" not in current_url.lower():
             print("   Session active, skipping login", file=sys.stderr)
             return
 
@@ -554,24 +567,37 @@ class SchwabScraper(BaseScraper):
                 item.get('description') or item.get('Description') or
                 item.get('TransactionDescription') or ''
             )
-            amount = (
-                item.get('amount') or item.get('Amount') or
-                item.get('runningBalance') or item.get('NetAmount') or
-                item.get('netAmount') or 0
+
+            # Bank transactions have separate withdrawalAmount/depositAmount fields
+            # Check these FIRST before falling back to generic amount fields
+            withdrawal = (
+                item.get('withdrawalAmount') or item.get('withdrawal') or
+                item.get('Withdrawal') or ''
             )
-            # Bank transactions may have separate withdrawal/deposit fields
-            withdrawal = item.get('withdrawal') or item.get('Withdrawal')
-            deposit = item.get('deposit') or item.get('Deposit')
-            if withdrawal and not amount:
-                amount = withdrawal
-                if isinstance(amount, str):
-                    amount = amount.replace(',', '').replace('$', '')
-                amount = -abs(float(amount)) if amount else 0
-            elif deposit and not amount:
-                amount = deposit
-                if isinstance(amount, str):
-                    amount = amount.replace(',', '').replace('$', '')
-                amount = abs(float(amount)) if amount else 0
+            deposit = (
+                item.get('depositAmount') or item.get('deposit') or
+                item.get('Deposit') or ''
+            )
+
+            amount = None
+            if withdrawal and withdrawal.strip():
+                w = withdrawal.replace(',', '').replace('$', '').strip()
+                if w:
+                    amount = -abs(float(w))
+            elif deposit and deposit.strip():
+                d = deposit.replace(',', '').replace('$', '').strip()
+                if d:
+                    amount = abs(float(d))
+
+            # Fall back to generic amount fields (brokerage transactions)
+            # but NEVER use runningBalance as the amount
+            if amount is None:
+                raw_amount = (
+                    item.get('amount') or item.get('Amount') or
+                    item.get('NetAmount') or item.get('netAmount') or 0
+                )
+                if raw_amount:
+                    amount = raw_amount
 
             action = item.get('action') or item.get('Action') or ''
             symbol = item.get('symbol') or item.get('Symbol') or ''
