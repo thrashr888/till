@@ -161,10 +161,13 @@ class SchwabScraper(BaseScraper):
         # Build account results
         account_results = []
         for acct in accounts:
-            account_id = hashlib.md5(acct["name"].encode()).hexdigest()[:16]
+            # Use account suffix for stable ID when available
+            suffix = acct.get("account_suffix", "")
+            id_key = f"schwab_{suffix}" if suffix else acct["name"]
+            account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
             account_results.append({
                 "account_id": account_id,
-                "account_name": acct["name"],
+                "account_name": f"{acct['name']} ...{suffix}" if suffix else acct["name"],
                 "account_type": acct.get("type", "other"),
                 "balance": acct["balance"],
                 "day_change": acct.get("day_change"),
@@ -198,8 +201,10 @@ class SchwabScraper(BaseScraper):
     async def _extract_accounts(self, page) -> list[dict]:
         """Extract Schwab accounts from the summary page.
 
-        Schwab summary page has a table inside div.allAccountsWrapper with columns:
-        Account Name | Type | Cash & Cash Investments | Account Value | Day Change $ | Day Change %
+        Real accounts have a sr-only span with "Account number ending in XXX".
+        Group headers and total rows do not. We use this to filter.
+
+        Columns: Account Name | Type | Cash & Cash Investments | Account Value | Day Change $ | Day Change %
         """
         accounts = []
 
@@ -210,170 +215,135 @@ class SchwabScraper(BaseScraper):
                 '[class*="allAccounts"], [class*="AccountsWrapper"]'
             )
 
-        if accounts_wrapper:
-            print("   Found accounts wrapper", file=sys.stderr)
-            account_rows = await accounts_wrapper.query_selector_all(
-                '[data-testid="account-row"], .account-row, [class*="AccountRow"], table tbody tr'
-            )
-            if not account_rows:
-                account_rows = await accounts_wrapper.query_selector_all(
-                    'tr, [class*="row"], [class*="Row"]'
-                )
-        else:
-            print("   No accounts wrapper found, using page-level search", file=sys.stderr)
-            account_rows = await page.query_selector_all(
-                '[data-testid="account-row"], .account-row, table tbody tr'
-            )
+        search_context = accounts_wrapper or page
+
+        # Get all table rows
+        account_rows = await search_context.query_selector_all(
+            'sdps-table-row, table tbody tr, [class*="AccountRow"]'
+        )
 
         for row in account_rows:
             try:
-                cells = await row.query_selector_all('td')
-
-                if cells and len(cells) >= 4:
-                    cell_texts = []
-                    for cell in cells:
-                        text = await cell.inner_text()
-                        cell_texts.append(text.strip())
-
-                    name = cell_texts[0] if cell_texts else ""
-
-                    # Skip headers, totals, and securities
-                    if not name or name.upper() in ['ACCOUNT NAME', 'NAME', 'CLICK']:
-                        continue
-                    if not re.search(r'[A-Za-z]', name):
-                        continue
-                    if name == "Investing Total" or '††' in name:
-                        continue
-                    if 'Held in' in name and 'Account' in name:
-                        continue
-                    # Skip stock tickers (all caps, 1-5 chars)
-                    first_word = name.split()[0] if name.split() else name
-                    if re.match(r'^[A-Z]{1,5}$', first_word):
-                        continue
-
-                    account_type = None
-                    account_value = None
-                    day_change = None
-                    day_change_percent = None
-
-                    for i, cell_text in enumerate(cell_texts[1:], 1):
-                        # Column 1: Type (text like "Brokerage", "IRA")
-                        if i == 1 and not cell_text.startswith('$') and '%' not in cell_text:
-                            if cell_text and cell_text not in ['-', '\u2013']:
-                                account_type = cell_text
-
-                        # Parse dollar amounts by column position
-                        dollar_match = re.search(r'([+-])?\$?([\d,]+\.?\d*)', cell_text)
-                        if dollar_match:
-                            sign = dollar_match.group(1) or ''
-                            amount = float(dollar_match.group(2).replace(',', ''))
-                            if sign == '-':
-                                amount = -amount
-                            # Columns: Name(0), Type(1), Cash(2), Value(3), Day$(4)
-                            if i == 3:
-                                account_value = amount
-                            elif i == 4:
-                                day_change = amount
-
-                        pct_match = re.search(r'([+-]?\d+\.?\d*)%', cell_text)
-                        if pct_match:
-                            day_change_percent = float(pct_match.group(1))
-
-                    if not account_type:
-                        account_type = self._infer_account_type(name)
-
-                    if account_value and account_value > 0:
-                        clean_name = name.rstrip('\u2020').strip()
-                        print(f"   {clean_name}: ${account_value:,.2f}", file=sys.stderr)
-                        accounts.append({
-                            "name": clean_name,
-                            "balance": account_value,
-                            "type": account_type or "other",
-                            "day_change": day_change,
-                            "day_change_percent": day_change_percent,
-                        })
+                # Skip group headers (they have account-list-table-group-header attribute)
+                is_header = await row.get_attribute('account-list-table-group-header')
+                if is_header is not None:
                     continue
 
-                # Fallback: parse from inner text
-                text = await row.inner_text()
-                lines = [line.strip() for line in text.split("\n") if line.strip()]
-                if len(lines) < 1:
+                # Only include rows with "Account number ending in" — these are real accounts
+                account_num_el = await row.query_selector('span.sr-only')
+                account_suffix = None
+                if account_num_el:
+                    sr_text = await account_num_el.inner_text()
+                    match = re.search(r'Account number ending in\s+(\S+)', sr_text)
+                    if match:
+                        account_suffix = match.group(1)
+
+                if account_suffix is None:
+                    # No account number = total/header row, skip
                     continue
 
-                name = lines[0]
-                if not re.search(r'[A-Za-z]', name) or len(name) <= 2:
+                # Get account name from the first cell
+                cells = await row.query_selector_all('sdps-table-cell, td')
+                if len(cells) < 4:
                     continue
 
-                all_text = " ".join(lines)
-                dollar_amounts = []
-                for match in re.finditer(r'([+-])?\$([\d,]+\.?\d*)', all_text):
-                    sign = match.group(1) or ''
-                    amount = float(match.group(2).replace(',', ''))
-                    if sign == '-':
-                        amount = -amount
-                    dollar_amounts.append(amount)
+                cell_texts = []
+                for cell in cells:
+                    text = await cell.inner_text()
+                    cell_texts.append(text.strip())
 
-                # Columns: Cash(0), Value(1), Day$(2)
-                account_value = dollar_amounts[1] if len(dollar_amounts) > 1 else (
-                    dollar_amounts[0] if dollar_amounts else None
-                )
-                day_change = dollar_amounts[2] if len(dollar_amounts) > 2 else None
+                # First cell contains: "Account Name\nCompanyName\n..."
+                raw_name = cell_texts[0]
+                # Extract just the account name (first line, before company name)
+                name_lines = [l.strip() for l in raw_name.split('\n') if l.strip()]
+                name = name_lines[0] if name_lines else raw_name
 
-                pct_match = re.search(r'([+-]?\d+\.?\d*)%', all_text)
-                day_change_percent = float(pct_match.group(1)) if pct_match else None
+                # Clean up name
+                name = name.rstrip('\u2020').strip()
+                if not name or 'Total' in name:
+                    continue
 
-                if account_value and account_value > 100:
-                    accounts.append({
-                        "name": name.rstrip('\u2020').strip(),
-                        "balance": account_value,
-                        "type": self._infer_account_type(name),
-                        "day_change": day_change,
-                        "day_change_percent": day_change_percent,
-                    })
+                # Extract account type
+                # Check Type column (cell index 1) — can be multi-line:
+                # "Schwab Bank\nType\nChecking" or just "Brokerage"
+                account_type = "other"
+                type_text = cell_texts[1] if len(cell_texts) > 1 else ""
+                # Also check the full row text for type keywords
+                full_text = " ".join(cell_texts).lower()
+                type_lines = [l.strip().lower() for l in type_text.split('\n') if l.strip()]
+                for tl in type_lines:
+                    if tl in ['checking']:
+                        account_type = "checking"
+                        break
+                    elif tl in ['savings']:
+                        account_type = "savings"
+                        break
+                    elif tl in ['brokerage']:
+                        account_type = "brokerage"
+                        break
+                    elif tl in ['ira', 'roth', 'roth contributory ira', 'traditional ira']:
+                        account_type = "ira"
+                        break
+
+                # Infer from name if type column didn't help
+                if account_type == "other":
+                    name_lower = name.lower()
+                    if 'checking' in name_lower:
+                        account_type = "checking"
+                    elif 'saving' in name_lower:
+                        account_type = "savings"
+                    elif '401' in name_lower or '401(k)' in name_lower:
+                        account_type = "401k"
+                    elif 'ira' in name_lower or 'roth' in name_lower or 'retirement' in name_lower:
+                        account_type = "ira"
+                    elif '529' in name_lower:
+                        account_type = "brokerage"
+                    elif 'etrade' in name_lower or 'individual' in name_lower:
+                        account_type = "brokerage"
+
+                # Parse dollar values from remaining cells
+                account_value = None
+                day_change = None
+                day_change_percent = None
+
+                for i, cell_text in enumerate(cell_texts[1:], 1):
+                    dollar_match = re.search(r'([+-])?\$?([\d,]+\.?\d*)', cell_text)
+                    if dollar_match:
+                        sign = dollar_match.group(1) or ''
+                        amount = float(dollar_match.group(2).replace(',', ''))
+                        if sign == '-':
+                            amount = -amount
+                        # Columns: Type(1), Cash(2), Value(3), Day$(4)
+                        if i == 3:
+                            account_value = amount
+                        elif i == 4:
+                            day_change = amount
+
+                    pct_match = re.search(r'([+-]?\d+\.?\d*)%', cell_text)
+                    if pct_match:
+                        day_change_percent = float(pct_match.group(1))
+
+                if account_value is None:
+                    account_value = 0.0
+
+                print(f"   {name} ...{account_suffix}: ${account_value:,.2f} ({account_type})", file=sys.stderr)
+                accounts.append({
+                    "name": name,
+                    "balance": account_value,
+                    "type": account_type,
+                    "account_suffix": account_suffix,
+                    "day_change": day_change,
+                    "day_change_percent": day_change_percent,
+                })
 
             except Exception as e:
                 print(f"   Error parsing row: {e}", file=sys.stderr)
                 continue
 
-        # Last resort fallback
         if not accounts:
-            print("   Fallback: extracting from page text", file=sys.stderr)
-            content = await page.content()
-            dollar_amounts = re.findall(r'\$([\d,]+\.?\d*)', content)
-            valid = [amt for amt in dollar_amounts if amt.strip()]
-            if valid:
-                try:
-                    balance = float(valid[0].replace(',', ''))
-                    accounts.append({
-                        "name": "Total Portfolio",
-                        "balance": balance,
-                        "type": "brokerage",
-                    })
-                except ValueError:
-                    pass
-
-        # Filter by allowed account types
-        if self.allowed_account_types:
-            filtered = [a for a in accounts if a.get("type") in self.allowed_account_types]
-            if len(filtered) < len(accounts):
-                skipped = len(accounts) - len(filtered)
-                print(f"   Filtered out {skipped} entries not matching types: {self.allowed_account_types}", file=sys.stderr)
-            return filtered
+            print("   No accounts found via structured extraction", file=sys.stderr)
 
         return accounts
-
-    def _infer_account_type(self, name: str) -> str:
-        """Infer account type from account name."""
-        name_lower = name.lower()
-        if any(w in name_lower for w in ['check', 'saving', 'bank']):
-            return "Bank"
-        if any(w in name_lower for w in ['ira', 'roth', 'traditional', 'rollover']):
-            return "Investment"
-        if any(w in name_lower for w in ['brokerage', 'individual', 'joint']):
-            return "Investment"
-        if any(w in name_lower for w in ['401k', '401(k)', 'hsa']):
-            return "Investment"
-        return "Investment"
 
     async def _extract_transactions(self, page) -> list[dict]:
         """Extract recent transactions."""
