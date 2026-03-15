@@ -52,7 +52,7 @@ class SchwabScraper(BaseScraper):
 
         # Session expired — go to login page
         print(f"   Session expired, logging in...", file=sys.stderr)
-        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=300000)
+        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
 
         if not (username and password):
             raise Exception(
@@ -122,7 +122,7 @@ class SchwabScraper(BaseScraper):
 
             print("   Waiting for login...", file=sys.stderr)
             try:
-                await page.wait_for_url("**/client.schwab.com/**", timeout=120000)
+                await page.wait_for_url("**/client.schwab.com/**", timeout=30000)
             except Exception:
                 pass
 
@@ -133,7 +133,7 @@ class SchwabScraper(BaseScraper):
                 print("   Waiting for 2FA...", file=sys.stderr)
                 await page.screenshot(path="/tmp/till_schwab_2fa.png")
                 try:
-                    await page.wait_for_url("**/app/accounts/**", timeout=120000)
+                    await page.wait_for_url("**/app/accounts/**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
                     await page.screenshot(path="/tmp/till_schwab_login.png")

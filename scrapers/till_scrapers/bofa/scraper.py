@@ -50,7 +50,7 @@ class BofaScraper(BaseScraper):
 
         # Session expired — go to login page
         print("   Session expired, logging in...", file=sys.stderr)
-        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=300000)
+        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
 
         if not (username and password):
             raise Exception(
@@ -105,7 +105,7 @@ class BofaScraper(BaseScraper):
             # Wait for navigation after login
             print("   Waiting for login...", file=sys.stderr)
             try:
-                await page.wait_for_url("**/secure.bankofamerica.com/**", timeout=120000)
+                await page.wait_for_url("**/secure.bankofamerica.com/**", timeout=30000)
             except Exception:
                 pass
 
@@ -116,7 +116,7 @@ class BofaScraper(BaseScraper):
                 print("   Waiting for 2FA / security challenge...", file=sys.stderr)
                 await page.screenshot(path="/tmp/till_bofa_2fa.png")
                 try:
-                    await page.wait_for_url("**/myaccounts/**", timeout=120000)
+                    await page.wait_for_url("**/myaccounts/**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
                     await page.screenshot(path="/tmp/till_bofa_login.png")

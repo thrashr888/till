@@ -74,7 +74,7 @@ class MorganstanleyScraper(BaseScraper):
 
         # Session expired — go to login page
         print("   Session expired, logging in...", file=sys.stderr)
-        await page.goto(login_url, wait_until="domcontentloaded", timeout=300000)
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
 
         if not (username and password):
@@ -196,7 +196,7 @@ class MorganstanleyScraper(BaseScraper):
             try:
                 await page.wait_for_url(
                     lambda url: "signin" not in url.lower() and "login" not in url.lower(),
-                    timeout=120000,
+                    timeout=30000,
                 )
             except Exception:
                 pass
@@ -210,7 +210,7 @@ class MorganstanleyScraper(BaseScraper):
                 try:
                     await page.wait_for_url(
                         lambda url: "signin" not in url.lower() and "login" not in url.lower(),
-                        timeout=120000,
+                        timeout=30000,
                     )
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:

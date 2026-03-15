@@ -44,7 +44,7 @@ class ChaseScraper(BaseScraper):
             await page.goto(
                 self.LOGIN_URL,
                 wait_until="domcontentloaded",
-                timeout=300000,
+                timeout=30000,
             )
             await page.wait_for_timeout(3000)
         except Exception as e:
@@ -226,7 +226,7 @@ class ChaseScraper(BaseScraper):
             try:
                 await page.wait_for_selector(
                     '[class*="account"], [class*="Account"], [data-testid*="account"]',
-                    timeout=120000,
+                    timeout=30000,
                 )
                 print("   Login successful!", file=sys.stderr)
             except Exception:
@@ -275,7 +275,7 @@ class ChaseScraper(BaseScraper):
             await page.goto(
                 "https://secure.chase.com/web/auth/dashboard",
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
         await page.wait_for_timeout(8000)
 

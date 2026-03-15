@@ -51,7 +51,7 @@ class FidelityScraper(BaseScraper):
 
         # Session expired — go to login page
         print("   Session expired, logging in...", file=sys.stderr)
-        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=300000)
+        await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
         await page.wait_for_timeout(2000)
 
         if not (username and password):
@@ -84,7 +84,7 @@ class FidelityScraper(BaseScraper):
 
             print("   Waiting for login...", file=sys.stderr)
             try:
-                await page.wait_for_url("**/portfolio/**", timeout=120000)
+                await page.wait_for_url("**/portfolio/**", timeout=30000)
             except Exception:
                 pass
 
@@ -95,7 +95,7 @@ class FidelityScraper(BaseScraper):
                 print("   Waiting for 2FA...", file=sys.stderr)
                 await page.screenshot(path="/tmp/till_fidelity_2fa.png")
                 try:
-                    await page.wait_for_url("**/portfolio/**", timeout=120000)
+                    await page.wait_for_url("**/portfolio/**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
                     await page.screenshot(path="/tmp/till_fidelity_login.png")
