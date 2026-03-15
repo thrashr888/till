@@ -3,13 +3,42 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct Config {
-    #[serde(default)]
     pub browser: BrowserConfig,
-    #[serde(flatten)]
     pub sources: HashMap<String, SourceConfig>,
+}
+
+impl Config {
+    /// Parse config from a TOML table, separating known sections from source sections.
+    pub fn from_toml(table: toml::Table) -> Result<Self> {
+        let mut sources = HashMap::new();
+        let mut browser = BrowserConfig::default();
+
+        for (key, value) in table {
+            match key.as_str() {
+                "browser" => {
+                    if let Ok(b) = value.try_into() {
+                        browser = b;
+                    }
+                }
+                _ => {
+                    // Everything else is a source
+                    match value.try_into::<SourceConfig>() {
+                        Ok(sc) => {
+                            sources.insert(key, sc);
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to parse source '{key}': {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self { browser, sources })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,8 +85,9 @@ fn default_true() -> bool {
 
 /// Config directory: `~/.config/till/`
 pub fn config_dir() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+    let dir = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?
+        .join(".config")
         .join("till");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -85,8 +115,8 @@ pub fn load_config_from(path: &Path) -> Result<Config> {
         return Ok(Config::default());
     }
     let content = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&content)?;
-    Ok(config)
+    let table: toml::Table = toml::from_str(&content)?;
+    Config::from_toml(table)
 }
 
 /// Get the browser user data directory, creating it if needed.
@@ -133,14 +163,23 @@ timeout = 300
 [schwab]
 enabled = true
 transaction_account = "1234"
+op_item = "schwab.com"
 
 [chase]
 enabled = true
 "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let table: toml::Table = toml::from_str(toml_str).unwrap();
+        let config = Config::from_toml(table).unwrap();
         assert_eq!(config.browser.timeout, 300);
         assert!(config.sources.contains_key("schwab"));
         assert!(config.sources["schwab"].enabled);
+        assert_eq!(
+            config.sources["schwab"]
+                .extra
+                .get("op_item")
+                .and_then(|v| v.as_str()),
+            Some("schwab.com")
+        );
     }
 
     #[test]
