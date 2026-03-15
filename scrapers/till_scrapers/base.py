@@ -86,6 +86,8 @@ class BaseScraper:
             await stealth.apply_stealth_async(page)
 
             try:
+                source_name = self.__class__.__name__.replace("Scraper", "").lower()
+
                 if self.replay_file:
                     # Replay mode: load local HTML
                     print(f"   Replaying from: {self.replay_file}", file=sys.stderr)
@@ -95,18 +97,31 @@ class BaseScraper:
                     # Live mode: navigate and optionally login
                     await self.navigate_and_login(page, username, password)
 
-                if self.save_html:
-                    source_name = self.__class__.__name__.replace("Scraper", "").lower()
-                    html_path = f"/tmp/till_{source_name}_page.html"
+                # Always save HTML + screenshot after login for offline debugging
+                try:
+                    html_path = f"/tmp/till_{source_name}_post_login.html"
                     content = await page.content()
                     Path(html_path).write_text(content)
-                    print(f"   Saved HTML to: {html_path}", file=sys.stderr)
+                    await page.screenshot(path=f"/tmp/till_{source_name}_post_login.png")
+                    print(f"   Saved post-login snapshot to {html_path}", file=sys.stderr)
+                except Exception:
+                    pass
 
                 if self.pause:
                     print("   PAUSED — inspect the browser, then press Enter...", file=sys.stderr)
                     input()
 
                 result = await self.extract(page)
+
+                # Save post-extract snapshot too
+                try:
+                    html_path = f"/tmp/till_{source_name}_post_extract.html"
+                    content = await page.content()
+                    Path(html_path).write_text(content)
+                    await page.screenshot(path=f"/tmp/till_{source_name}_post_extract.png")
+                except Exception:
+                    pass
+
                 return result
 
             finally:

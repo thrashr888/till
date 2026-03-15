@@ -221,7 +221,6 @@ class ChaseScraper(BaseScraper):
 
             # Wait for login/2FA to complete
             print("   Waiting for login to complete...", file=sys.stderr)
-            print("   If phone verification is required, please approve now...", file=sys.stderr)
 
             try:
                 await page.wait_for_selector(
@@ -231,16 +230,25 @@ class ChaseScraper(BaseScraper):
                 print("   Login successful!", file=sys.stderr)
             except Exception:
                 current_url = page.url
-                await page.screenshot(path="/tmp/till_chase_after_wait.png")
                 if "dashboard" in current_url.lower() or "account" in current_url.lower():
                     print("   Appears to be logged in, continuing...", file=sys.stderr)
+                elif "identity" in current_url.lower() or "verify" in current_url.lower():
+                    print("   2FA required — approve on Chase mobile app...", file=sys.stderr)
+                    await page.screenshot(path="/tmp/till_chase_2fa.png")
+                    raise Exception(
+                        "2FA required. Run `till test --source chase --headful --pause` to approve."
+                    )
                 else:
                     print(f"   Post-login URL: {current_url}", file=sys.stderr)
-                    raise Exception(
-                        f"Login may have failed. Check /tmp/till_chase_after_wait.png. URL: {current_url}"
-                    )
+                    raise Exception(f"Login may have failed. URL: {current_url}")
 
         except Exception as e:
+            err_msg = str(e)
+            # "Frame was detached" means login succeeded but iframe was replaced — not a real error
+            if "Frame was detached" in err_msg or "frame was detached" in err_msg:
+                print("   Login iframe detached (normal after submit), continuing...", file=sys.stderr)
+                await page.wait_for_timeout(3000)
+                return
             print(f"   Auto-login failed: {e}", file=sys.stderr)
             await page.screenshot(path="/tmp/till_chase_login_error.png")
             raise
@@ -365,141 +373,173 @@ class ChaseScraper(BaseScraper):
     # ── API parsing ──────────────────────────────────────────────────
 
     def _parse_accounts_from_api(self, data) -> list[dict]:
-        """Parse accounts from Chase's internal API response."""
+        """Parse accounts from Chase's internal API response.
+
+        Chase card/list API shape:
+        {
+            "nickname": "Prime Visa",
+            "mask": "6173",
+            "accountId": 708766523,
+            "detail": {
+                "currentBalance": 1735.15,
+                "availableCredit": 27003.17,
+                "creditLimit": 28800.0,
+                ...
+            }
+        }
+        """
         accounts = []
 
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
+        # Chase card/list returns a single card object (not a list)
+        if isinstance(data, dict):
+            # Direct card object with nickname + mask + detail
+            if 'nickname' in data and 'mask' in data:
+                acct = self._parse_chase_card(data)
+                if acct:
+                    accounts.append(acct)
+                return accounts
+
+            # Look for nested lists
             for key in ['accounts', 'Accounts', 'accountList', 'cards', 'cardList']:
                 if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
-            if not items:
-                for val in data.values():
-                    if isinstance(val, list) and len(val) > 0:
-                        if isinstance(val[0], dict) and any(
-                            k in val[0] for k in [
-                                'accountId', 'AccountId', 'accountNumber',
-                                'currentBalance', 'balance', 'availableCredit',
-                            ]
-                        ):
-                            items = val
-                            break
+                    for item in data[key]:
+                        acct = self._parse_chase_card(item)
+                        if acct:
+                            accounts.append(acct)
+                    return accounts
 
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            name = (
-                item.get('accountName') or item.get('AccountName') or
-                item.get('cardName') or item.get('displayName') or
-                item.get('nickName') or item.get('productName') or ''
-            )
-            balance = (
-                item.get('currentBalance') or item.get('balance') or
-                item.get('currentBalanceAmount') or item.get('Balance') or 0
-            )
-            available = (
-                item.get('availableCredit') or item.get('available_credit') or
-                item.get('creditAvailable') or item.get('AvailableCredit') or 0
-            )
-            acct_num = (
-                item.get('accountNumber') or item.get('AccountNumber') or
-                item.get('accountId') or item.get('AccountId') or ''
-            )
-
-            if isinstance(balance, str):
-                try:
-                    balance = float(balance.replace(',', '').replace('$', ''))
-                except ValueError:
-                    balance = 0
-            if isinstance(available, str):
-                try:
-                    available = float(available.replace(',', '').replace('$', ''))
-                except ValueError:
-                    available = 0
-
-            last4 = str(acct_num)[-4:] if acct_num else ""
-
-            if name:
-                print(f"   API: {name} ...{last4}: ${balance:,.2f}", file=sys.stderr)
-                account_id = hashlib.md5(f"chase_{name}_{last4}".encode()).hexdigest()[:16]
-                accounts.append({
-                    "id": account_id,
-                    "name": name,
-                    "balance": float(balance) if balance else 0.0,
-                    "available_credit": float(available) if available else None,
-                    "last4": last4,
-                    "chase_account_id": item.get('accountId') or item.get('AccountId') or '',
-                })
+        if isinstance(data, list):
+            for item in data:
+                acct = self._parse_chase_card(item)
+                if acct:
+                    accounts.append(acct)
 
         return accounts
 
+    def _parse_chase_card(self, item: dict) -> dict | None:
+        """Parse a single Chase credit card from API data."""
+        if not isinstance(item, dict):
+            return None
+
+        name = item.get('nickname') or item.get('accountName') or item.get('displayName') or ''
+        last4 = str(item.get('mask') or item.get('accountNumber') or '')[-4:]
+
+        detail = item.get('detail', {})
+        balance = float(detail.get('currentBalance', 0) or item.get('currentBalance', 0) or 0)
+        available = float(detail.get('availableCredit', 0) or item.get('availableCredit', 0) or 0)
+        credit_limit = float(detail.get('creditLimit', 0) or 0)
+
+        if not name:
+            return None
+
+        account_id = hashlib.md5(f"chase_{name}_{last4}".encode()).hexdigest()[:16]
+        print(f"   API: {name} ...{last4}: balance=${balance:,.2f} avail=${available:,.2f}", file=sys.stderr)
+
+        return {
+            "id": account_id,
+            "name": name,
+            "balance": balance,
+            "available_credit": available,
+            "credit_limit": credit_limit,
+            "last4": last4,
+            "chase_account_id": str(item.get('accountId', '')),
+        }
+
     def _parse_transactions_from_api(self, data, account_id: str) -> list[dict]:
-        """Parse transactions from Chase's internal API response."""
+        """Parse transactions from Chase's internal API response.
+
+        Chase activities API shape:
+        {
+            "activities": [{
+                "transactionDate": "2026-03-14",
+                "transactionAmount": 15.16,
+                "creditDebitCode": "D",  // D=debit (charge), C=credit (payment)
+                "transactionStatusCode": "Pending" or "Posted",
+                "etuStandardTransactionTypeGroupName": "PURCHASE",
+                "merchantDetails": {"rawMerchantDetails": {...}, "enrichedMerchants": [...]},
+            }]
+        }
+        """
         transactions = []
 
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            for key in [
-                'transactions', 'Transactions', 'transactionList',
-                'postedTransactions', 'pendingTransactions',
-                'activityList', 'activities',
-            ]:
-                if key in data and isinstance(data[key], list) and data[key]:
+        items = data.get('activities', []) if isinstance(data, dict) else []
+        if not items:
+            # Try other keys
+            for key in ['transactions', 'postedTransactions', 'pendingTransactions']:
+                if isinstance(data, dict) and key in data and isinstance(data[key], list):
                     items = data[key]
-                    print(f"   Found {len(items)} transactions in '{key}'", file=sys.stderr)
                     break
 
         for item in items:
             if not isinstance(item, dict):
                 continue
 
-            date = (
-                item.get('transactionDate') or item.get('postDate') or
-                item.get('date') or item.get('Date') or ''
-            )
-            desc = (
-                item.get('description') or item.get('merchantName') or
-                item.get('merchant') or item.get('Description') or ''
-            )
-            amount = (
-                item.get('amount') or item.get('Amount') or
-                item.get('transactionAmount') or 0
-            )
+            date = item.get('transactionDate') or item.get('postDate') or ''
+            amount = float(item.get('transactionAmount', 0) or item.get('amount', 0) or 0)
 
-            if isinstance(amount, str):
-                try:
-                    amount = float(amount.replace(',', '').replace('$', ''))
-                except ValueError:
-                    amount = 0
+            # Get merchant name from merchantDetails
+            merchant_details = item.get('merchantDetails', {})
+            desc = ''
+            enriched = merchant_details.get('enrichedMerchants', [])
+            if enriched and isinstance(enriched, list):
+                desc = enriched[0].get('merchantName', '') if isinstance(enriched[0], dict) else ''
+            if not desc:
+                raw = merchant_details.get('rawMerchantDetails', {})
+                desc = raw.get('name', '') if isinstance(raw, dict) else ''
+            if not desc:
+                desc = item.get('description') or item.get('merchantName') or ''
+            if not desc:
+                desc = item.get('etuStandardTransactionTypeGroupName', 'Unknown')
 
-            if date and desc:
-                # Normalize date to ISO
-                iso_date = self._normalize_date(date)
+            if not date:
+                continue
 
-                # Credit card: charges are negative, payments are positive
-                if amount > 0:
-                    amount = -amount  # charges stored as negative
+            iso_date = self._normalize_date(date)
 
-                txn_id = hashlib.md5(
-                    f"chase_{iso_date}_{desc}_{amount}".encode()
-                ).hexdigest()[:16]
-                transactions.append({
-                    "id": txn_id,
-                    "account_id": account_id,
-                    "date": iso_date,
-                    "description": desc.strip()[:100],
-                    "amount": float(amount),
-                    "category": self._infer_category(desc),
-                    "status": "pending" if item.get('isPending') else "posted",
-                })
+            # D=debit (charge), C=credit (payment/refund)
+            credit_debit = item.get('creditDebitCode', 'D')
+            if credit_debit == 'D':
+                amount = -abs(amount)  # charges negative
+            else:
+                amount = abs(amount)   # payments/credits positive
+
+            status = 'pending' if item.get('transactionStatusCode', '').lower() == 'pending' else 'posted'
+
+            category_group = item.get('etuStandardTransactionTypeGroupName', '')
+            category = self._map_chase_category(category_group, desc)
+
+            txn_id = hashlib.md5(
+                f"chase_{iso_date}_{desc}_{amount}_{item.get('sorTransactionIdentifier', '')}".encode()
+            ).hexdigest()[:16]
+
+            transactions.append({
+                "id": txn_id,
+                "account_id": account_id,
+                "date": iso_date,
+                "description": desc.strip()[:100],
+                "amount": amount,
+                "category": category,
+                "status": status,
+            })
 
         return transactions
+
+    @staticmethod
+    def _map_chase_category(group: str, desc: str) -> str:
+        """Map Chase category group to standard category, with description fallback."""
+        group_map = {
+            'PURCHASE': 'Shopping',
+            'PAYMENT': 'Payment',
+            'RETURN': 'Refund',
+            'FEE': 'Fee',
+            'INTEREST': 'Interest',
+            'REWARD': 'Reward',
+            'ADJUSTMENT': 'Adjustment',
+        }
+        mapped = group_map.get(group.upper(), '')
+        if mapped:
+            return mapped
+        return ChaseScraper._infer_category(desc)
 
     # ── DOM / text extraction ────────────────────────────────────────
 
@@ -756,117 +796,60 @@ class ChaseScraper(BaseScraper):
     # ── Transaction extraction ───────────────────────────────────────
 
     async def _extract_transactions(self, page, account: dict, api_responses: dict) -> list[dict]:
-        """Extract transactions for one account via API interception + DOM fallback."""
+        """Extract full transaction history using direct API calls with session cookies.
+
+        Chase API: /svc/rr/accounts/secure/gateway/credit-card/transactions/
+        inquiry-maintenance/etu-transactions/v4/accounts/transactions
+        Supports record-count=200 and provides statementCycles for pagination.
+        """
         transactions = []
         account_id = account["id"]
         account_name = account.get("name", "Chase Card")
-        account_url = account.get("url", "")
+        chase_acct_id = account.get("chase_account_id", "")
 
-        # Navigate to account activity page
-        if account_url:
-            try:
-                print(f"   Navigating to {account_name} activity...", file=sys.stderr)
-                await page.goto(account_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(5000)
-            except Exception as e:
-                print(f"   Navigation failed: {e}", file=sys.stderr)
-                return transactions
-        else:
-            # Try clicking into the account from dashboard
-            try:
-                acct_links = await page.query_selector_all('a[href*="activity"]')
-                clicked = False
-                for link in acct_links:
-                    link_text = await link.inner_text()
-                    if account_name.split()[0].lower() in link_text.lower():
-                        await link.click()
-                        await page.wait_for_timeout(5000)
-                        clicked = True
-                        break
-                if not clicked:
-                    # Try clicking the account tile itself
-                    for selector in ['a', 'button']:
-                        elems = await page.query_selector_all(selector)
-                        for elem in elems:
-                            try:
-                                text = await elem.inner_text()
-                                if account_name in text or (account.get("last4") and account["last4"] in text):
-                                    await elem.click()
-                                    await page.wait_for_timeout(5000)
-                                    clicked = True
-                                    break
-                            except Exception:
-                                continue
-                        if clicked:
-                            break
-            except Exception as e:
-                print(f"   Could not navigate to account: {e}", file=sys.stderr)
-                return transactions
-
-        await page.screenshot(path=f"/tmp/till_chase_{account_id}_activity.png")
-
-        # Try to extend date range to see more transactions
-        await self._try_extend_date_range(page)
-
-        # Check API responses for transaction data
-        for url, data in api_responses.items():
-            if any(k in url.lower() for k in ['transaction', 'activity']):
-                api_txns = self._parse_transactions_from_api(data, account_id)
-                if api_txns:
-                    transactions.extend(api_txns)
-
-        if transactions:
-            print(f"   Parsed {len(transactions)} transactions from API for {account_name}", file=sys.stderr)
+        if not chase_acct_id:
+            print(f"   No Chase account ID for {account_name}, skipping", file=sys.stderr)
             return transactions
 
-        # Fallback: parse from page text
-        print("   No transactions from API, trying text extraction...", file=sys.stderr)
-        try:
-            page_text = await page.inner_text("body")
-            transactions = self._parse_transactions_from_text(page_text, account_id)
-        except Exception as e:
-            print(f"   Text extraction failed: {e}", file=sys.stderr)
+        base_url = (
+            "https://secure.chase.com/svc/rr/accounts/secure/gateway/credit-card/"
+            "transactions/inquiry-maintenance/etu-transactions/v4/accounts/transactions"
+        )
 
-        # Fallback: CSS selector rows
+        print(f"   Fetching transactions for {account_name} (all history)...", file=sys.stderr)
+        try:
+            # First call — get current transactions + statement cycles list
+            url = (
+                f"{base_url}?digital-account-identifier={chase_acct_id}"
+                f"&provide-available-statement-indicator=true"
+                f"&record-count=200&sort-order-code=D&sort-key-code=T"
+            )
+            response = await page.request.get(url, timeout=30000)
+            if not response.ok:
+                print(f"   Transaction API returned {response.status}", file=sys.stderr)
+                return transactions
+
+            data = await response.json()
+            txns = self._parse_transactions_from_api(data, account_id)
+            transactions.extend(txns)
+            print(f"   Current cycle: {len(txns)} transactions", file=sys.stderr)
+
+            # Save for debugging
+            with open(f"/tmp/till_chase_{account_id}_txns.json", 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+
+        except Exception as e:
+            print(f"   Transaction API failed: {e}", file=sys.stderr)
+
+        # Check intercepted responses as fallback
         if not transactions:
-            print("   Trying CSS selectors for transactions...", file=sys.stderr)
-            for selector in [
-                'div[class*="transaction"]',
-                'tr[class*="transaction"]',
-                '[data-testid*="transaction"]',
-                '[class*="activity"] li',
-            ]:
-                rows = await page.query_selector_all(selector)
-                if rows:
-                    print(f"   Found {len(rows)} rows with: {selector}", file=sys.stderr)
-                    for row in rows:
-                        try:
-                            text = await row.inner_text()
-                            txn = self._parse_transaction_row(text, account_id)
-                            if txn:
-                                transactions.append(txn)
-                        except Exception:
-                            continue
-                    break
+            for url, data in api_responses.items():
+                if 'transaction' in url.lower():
+                    txns = self._parse_transactions_from_api(data, account_id)
+                    transactions.extend(txns)
 
         print(f"   Found {len(transactions)} transactions for {account_name}", file=sys.stderr)
         return transactions
-
-    async def _try_extend_date_range(self, page):
-        """Try to extend the transaction date range to see more history."""
-        for selector in [
-            'button:has-text("Last 90 days")',
-            'button:has-text("90 days")',
-            '[aria-label*="date range"]',
-        ]:
-            try:
-                elem = await page.query_selector(selector)
-                if elem and await elem.is_visible():
-                    await elem.click()
-                    await page.wait_for_timeout(3000)
-                    break
-            except Exception:
-                continue
 
     def _parse_transactions_from_text(self, page_text: str, account_id: str) -> list[dict]:
         """Parse transactions from page text using regex patterns.
