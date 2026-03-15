@@ -12,7 +12,15 @@ import sys
 import hashlib
 import json
 import os
+from pathlib import Path
 from till_scrapers.base import BaseScraper
+
+
+def _mask_acct(num: str) -> str:
+    """Mask all but last 4 characters of an account number."""
+    if len(num) <= 4:
+        return f"...{num}"
+    return f"...{num[-4:]}"
 
 
 class WellsfargoScraper(BaseScraper):
@@ -28,6 +36,15 @@ class WellsfargoScraper(BaseScraper):
         include_str = os.environ.get("TILL_WELLSFARGO_INCLUDE_ACCOUNTS", "")
         self.include_accounts = [s.strip() for s in include_str.split(",") if s.strip()] if include_str else []
 
+    async def _save_debug_snapshot(self, page, label: str):
+        """Save screenshot + HTML for debugging."""
+        try:
+            await page.screenshot(path=f"/tmp/till_wellsfargo_{label}.png")
+            html = await page.content()
+            Path(f"/tmp/till_wellsfargo_{label}.html").write_text(html)
+        except Exception:
+            pass
+
     async def navigate_and_login(self, page, username: str, password: str):
         # Try accounts page first — session cookies may still be valid
         print("   Checking for active session...", file=sys.stderr)
@@ -35,9 +52,9 @@ class WellsfargoScraper(BaseScraper):
             await page.goto(
                 self.DASHBOARD_URL,
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -70,20 +87,17 @@ class WellsfargoScraper(BaseScraper):
             await page.wait_for_selector('#j_username', timeout=15000)
 
             # Username
-            print("   Entering username...", file=sys.stderr)
             await page.locator('#j_username').click()
             await page.locator('#j_username').fill("")
             await page.locator('#j_username').type(username, delay=50)
             await page.wait_for_timeout(500)
 
             # Password
-            print("   Entering password...", file=sys.stderr)
             await page.locator('#j_password').click()
             await page.locator('#j_password').type(password, delay=30)
             await page.wait_for_timeout(500)
 
             # Submit
-            print("   Clicking login...", file=sys.stderr)
             await page.locator('#submitButton').click()
 
             print("   Waiting for login...", file=sys.stderr)
@@ -95,22 +109,25 @@ class WellsfargoScraper(BaseScraper):
             if "accounts" in page.url and "login" not in page.url.lower():
                 print("   Login successful!", file=sys.stderr)
             else:
-                print(f"   Post-login: {page.url}", file=sys.stderr)
                 print("   Waiting for 2FA...", file=sys.stderr)
-                await page.screenshot(path="/tmp/till_wellsfargo_2fa.png")
+                await self._save_debug_snapshot(page, "2fa")
                 try:
                     await page.wait_for_url("**/accounts/**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
-                    await page.screenshot(path="/tmp/till_wellsfargo_login.png")
-                    raise Exception(f"Login failed. URL: {page.url}")
+                    await self._save_debug_snapshot(page, "login_fail")
+                    raise Exception(
+                        f"Login failed. URL: {page.url}  "
+                        f"-- Try running headful with --pause"
+                    )
 
         except Exception as e:
+            await self._save_debug_snapshot(page, "login_fail")
             print(f"   Auto-login failed: {e}", file=sys.stderr)
-            await page.screenshot(path="/tmp/till_wellsfargo_login.png")
             raise
 
         await page.wait_for_timeout(2000)
+        await self._save_debug_snapshot(page, "post_login")
 
     async def extract(self, page) -> dict:
         """Extract accounts and transactions using Wells Fargo's internal APIs."""
@@ -140,11 +157,31 @@ class WellsfargoScraper(BaseScraper):
         await page.goto(
             self.DASHBOARD_URL,
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=30000,
         )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
 
-        await page.screenshot(path="/tmp/till_wellsfargo_accounts.png")
+        # Step 2b: Try direct API calls for account data
+        print("   Trying direct API calls...", file=sys.stderr)
+        api_endpoints = [
+            "https://connect.secure.wellsfargo.com/das/accounts/summary",
+            "https://connect.secure.wellsfargo.com/apis/accounts/summary",
+            "https://connect.secure.wellsfargo.com/api/accounts",
+        ]
+        for endpoint in api_endpoints:
+            try:
+                resp = await page.request.get(endpoint, timeout=10000)
+                if resp.status == 200:
+                    ct = resp.headers.get('content-type', '')
+                    if 'json' in ct:
+                        body = await resp.text()
+                        if body and body.strip() and body.strip()[0] in '{[':
+                            api_responses[endpoint] = json.loads(body)
+                            print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+            except Exception:
+                pass
+
+        await self._save_debug_snapshot(page, "accounts")
 
         # Step 3: Parse accounts from intercepted API responses
         accounts = []
@@ -201,7 +238,7 @@ class WellsfargoScraper(BaseScraper):
             account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
             account_results.append({
                 "account_id": account_id,
-                "account_name": f"{acct['name']} ...{suffix}" if suffix else acct["name"],
+                "account_name": f"{acct['name']} {_mask_acct(suffix)}" if suffix else acct["name"],
                 "account_type": acct.get("type", "other"),
                 "balance": acct["balance"],
                 "day_change": acct.get("day_change"),
@@ -238,7 +275,7 @@ class WellsfargoScraper(BaseScraper):
             items = data
         elif isinstance(data, dict):
             for key in [
-                'Accounts', 'accounts', 'accountList', 'AccountList',
+                'Accounts', 'accounts', 'accountList',
                 'accountSummary', 'summary', 'Items', 'items', 'data',
             ]:
                 if key in data and isinstance(data[key], list):
@@ -294,7 +331,7 @@ class WellsfargoScraper(BaseScraper):
             )
 
             if name:
-                print(f"   API: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+                print(f"   API: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
                 accounts.append({
                     "name": name,
                     "balance": float(balance) if balance else 0.0,
@@ -310,15 +347,9 @@ class WellsfargoScraper(BaseScraper):
         """Fallback: extract accounts from DOM on Wells Fargo accounts page."""
         accounts = []
 
-        # Wells Fargo groups accounts by type (checking, savings, etc.)
+        # Wells Fargo groups accounts by type — top selectors only
         for selector in [
-            '.account-tile',
-            '.account-card',
-            '[data-testid*="account"]',
-            '.account-row',
-            'div[class*="AccountTile"]',
-            'div[class*="account-summary"]',
-            '.a-account',
+            '.account-tile', '[data-testid*="account"]', 'div[class*="AccountTile"]',
         ]:
             rows = await page.query_selector_all(selector)
             if rows:
@@ -340,19 +371,6 @@ class WellsfargoScraper(BaseScraper):
                 try:
                     acct = await self._parse_dom_table_row(row)
                     if acct:
-                        accounts.append(acct)
-                except Exception:
-                    continue
-
-        # Final fallback: scan for any elements with dollar amounts near account names
-        if not accounts:
-            print("   DOM: trying broad scan for accounts...", file=sys.stderr)
-            # Look for common WF account display patterns
-            elements = await page.query_selector_all('a[href*="account"], div[class*="account" i]')
-            for elem in elements:
-                try:
-                    acct = await self._parse_dom_account(elem)
-                    if acct and acct["balance"] > 0:
                         accounts.append(acct)
                 except Exception:
                     continue
@@ -397,7 +415,7 @@ class WellsfargoScraper(BaseScraper):
             return None
 
         acct_type = self._infer_type(name)
-        print(f"   DOM: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+        print(f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
 
         return {
             "name": name,
@@ -443,7 +461,7 @@ class WellsfargoScraper(BaseScraper):
             return None
 
         acct_type = self._infer_type(name)
-        print(f"   DOM: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+        print(f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
 
         return {
             "name": name,
@@ -464,19 +482,18 @@ class WellsfargoScraper(BaseScraper):
             await page.goto(
                 "https://connect.secure.wellsfargo.com/accounts/start",
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(5000)
+            await page.wait_for_timeout(3000)
 
             # Click on the target account to view its activity
             if self.transaction_account:
-                print(f"   Looking for account ...{self.transaction_account}...", file=sys.stderr)
+                print(f"   Looking for account {_mask_acct(self.transaction_account)}...", file=sys.stderr)
                 found = False
                 for elem in await page.query_selector_all('a, button, div[role="link"]'):
                     try:
                         text = await elem.inner_text()
                         if self.transaction_account in text and await elem.is_visible():
-                            print(f"   Clicking: {text.strip()[:60]}", file=sys.stderr)
                             await elem.click()
                             found = True
                             break
@@ -484,12 +501,32 @@ class WellsfargoScraper(BaseScraper):
                         continue
 
                 if found:
-                    await page.wait_for_timeout(8000)
-                    await page.screenshot(path="/tmp/till_wellsfargo_history.png")
+                    await page.wait_for_timeout(5000)
+                    await self._save_debug_snapshot(page, "history")
                 else:
-                    print(f"   Could not find account ...{self.transaction_account}", file=sys.stderr)
+                    print(f"   Could not find account {_mask_acct(self.transaction_account)}", file=sys.stderr)
         except Exception as e:
             print(f"   Transaction navigation error: {e}", file=sys.stderr)
+
+        # Try direct API calls for transactions
+        print("   Trying direct API calls for transactions...", file=sys.stderr)
+        txn_endpoints = [
+            "https://connect.secure.wellsfargo.com/das/transactions/recent",
+            "https://connect.secure.wellsfargo.com/apis/transactions",
+            "https://connect.secure.wellsfargo.com/api/transactions",
+        ]
+        for endpoint in txn_endpoints:
+            try:
+                resp = await page.request.get(endpoint, timeout=10000)
+                if resp.status == 200:
+                    ct = resp.headers.get('content-type', '')
+                    if 'json' in ct:
+                        body = await resp.text()
+                        if body and body.strip() and body.strip()[0] in '{[':
+                            api_responses[endpoint] = json.loads(body)
+                            print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+            except Exception:
+                pass
 
         # Parse transactions from API responses
         for url, data in api_responses.items():

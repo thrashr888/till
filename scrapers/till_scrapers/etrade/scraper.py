@@ -13,16 +13,23 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-import keyring
-import pyetrade
-from requests_oauthlib import OAuth1Session
+try:
+    import keyring
+    import pyetrade
+    from requests_oauthlib import OAuth1Session
+
+    _PYETRADE_AVAILABLE = True
+except ImportError:
+    _PYETRADE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +40,44 @@ KEYCHAIN_TOKEN_KEY = "oauth_tokens"
 # E*Trade tokens expire after 2 hours
 TOKEN_MAX_AGE = 7000  # ~2h minus buffer
 
-# API timeout for all calls
+# API timeout for all calls (seconds)
 API_TIMEOUT = 30
+
+# Transaction history window (days)
+TRANSACTION_HISTORY_DAYS = 180
+
+# Path hint for re-auth instructions
+_SCRAPERS_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+class ApiTimeoutError(Exception):
+    """Raised when an API call exceeds the timeout."""
+
+
+@contextmanager
+def api_timeout(seconds: int = API_TIMEOUT):
+    """Context manager that raises ApiTimeoutError after `seconds`.
+
+    Uses SIGALRM on Unix. Falls back to no-op on Windows.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        # Windows: no SIGALRM support, skip timeout enforcement
+        yield
+        return
+
+    def _handler(signum, frame):
+        raise ApiTimeoutError(
+            f"E*Trade API call timed out after {seconds}s. "
+            "The API may be slow or unreachable. Try again later."
+        )
+
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def _op_read(ref: str) -> str | None:
@@ -135,6 +178,14 @@ def _load_tokens() -> OAuthTokens | None:
     return None
 
 
+def _reauth_instructions() -> str:
+    """Return a user-friendly message explaining how to re-authenticate."""
+    return (
+        "Run interactively to re-authenticate:\n"
+        f"  cd {_SCRAPERS_DIR} && uv run --directory scrapers till-scrape --source etrade"
+    )
+
+
 def _authenticate_interactive(consumer_key: str, consumer_secret: str) -> OAuthTokens:
     """Run the interactive OAuth browser flow. Returns tokens."""
     session = OAuth1Session(
@@ -144,8 +195,14 @@ def _authenticate_interactive(consumer_key: str, consumer_secret: str) -> OAuthT
 
     # Step 1: Get request token
     try:
-        request_tokens = session.fetch_request_token(
-            "https://api.etrade.com/oauth/request_token"
+        with api_timeout(API_TIMEOUT):
+            request_tokens = session.fetch_request_token(
+                "https://api.etrade.com/oauth/request_token"
+            )
+    except ApiTimeoutError:
+        raise RuntimeError(
+            "Timed out fetching OAuth request token from E*Trade. "
+            "Check your network connection and try again."
         )
     except Exception as exc:
         raise RuntimeError(
@@ -176,8 +233,14 @@ def _authenticate_interactive(consumer_key: str, consumer_secret: str) -> OAuthT
     session._client.client.verifier = verifier
 
     try:
-        token_data = session.fetch_access_token(
-            "https://api.etrade.com/oauth/access_token"
+        with api_timeout(API_TIMEOUT):
+            token_data = session.fetch_access_token(
+                "https://api.etrade.com/oauth/access_token"
+            )
+    except ApiTimeoutError:
+        raise RuntimeError(
+            "Timed out exchanging verification code for access token. "
+            "The code may have expired. Try again."
         )
     except Exception as exc:
         raise RuntimeError(
@@ -211,15 +274,18 @@ def _get_tokens(consumer_key: str, consumer_secret: str) -> OAuthTokens:
                 resource_owner_key=tokens.access_token,
                 resource_owner_secret=tokens.access_token_secret,
             )
-            if manager.renew_access_token():
-                renewed = OAuthTokens(
-                    access_token=tokens.access_token,
-                    access_token_secret=tokens.access_token_secret,
-                    timestamp=time.time(),
-                )
-                _save_tokens(renewed)
-                logger.info("Token renewed successfully")
-                return renewed
+            with api_timeout(API_TIMEOUT):
+                if manager.renew_access_token():
+                    renewed = OAuthTokens(
+                        access_token=tokens.access_token,
+                        access_token_secret=tokens.access_token_secret,
+                        timestamp=time.time(),
+                    )
+                    _save_tokens(renewed)
+                    logger.info("Token renewed successfully")
+                    return renewed
+        except ApiTimeoutError:
+            logger.warning("Token renewal timed out after %ds", API_TIMEOUT)
         except Exception:
             logger.debug("Token renewal failed, will re-authenticate")
 
@@ -227,8 +293,7 @@ def _get_tokens(consumer_key: str, consumer_secret: str) -> OAuthTokens:
     if not sys.stdin.isatty():
         reason = "expired" if tokens else "missing"
         raise RuntimeError(
-            f"E*Trade authentication required (tokens {reason}). "
-            f"Run `till-scrape --source etrade` interactively to authenticate."
+            f"E*Trade OAuth tokens are {reason}. {_reauth_instructions()}"
         )
 
     return _authenticate_interactive(consumer_key, consumer_secret)
@@ -241,6 +306,19 @@ def _ensure_list(value) -> list:
     if isinstance(value, list):
         return value
     return []
+
+
+def _error_result(error: str) -> dict:
+    """Return a standard error result dict."""
+    return {
+        "status": "error",
+        "source": "etrade",
+        "error": error,
+        "accounts": [],
+        "transactions": [],
+        "positions": [],
+        "balance_history": [],
+    }
 
 
 class EtradeScraper:
@@ -257,31 +335,21 @@ class EtradeScraper:
 
         Args are accepted for interface compat but ignored (uses OAuth, not username/password).
         """
+        if not _PYETRADE_AVAILABLE:
+            return _error_result(
+                "pyetrade is not installed. Install it with: "
+                "uv pip install pyetrade keyring requests-oauthlib"
+            )
+
         try:
             consumer_key, consumer_secret = _load_credentials(sandbox=self.sandbox)
         except RuntimeError as e:
-            return {
-                "status": "error",
-                "source": "etrade",
-                "error": str(e),
-                "accounts": [],
-                "transactions": [],
-                "positions": [],
-                "balance_history": [],
-            }
+            return _error_result(str(e))
 
         try:
             tokens = _get_tokens(consumer_key, consumer_secret)
         except RuntimeError as e:
-            return {
-                "status": "error",
-                "source": "etrade",
-                "error": str(e),
-                "accounts": [],
-                "transactions": [],
-                "positions": [],
-                "balance_history": [],
-            }
+            return _error_result(str(e))
 
         dev = self.sandbox
         accounts_api = pyetrade.ETradeAccounts(
@@ -295,17 +363,21 @@ class EtradeScraper:
         # --- List accounts ---
         print("   Fetching E*Trade accounts via API...", file=sys.stderr)
         try:
-            acct_resp = accounts_api.list_accounts(resp_format="json")
+            with api_timeout(API_TIMEOUT):
+                acct_resp = accounts_api.list_accounts(resp_format="json")
+        except ApiTimeoutError:
+            return _error_result(
+                f"Timed out listing accounts after {API_TIMEOUT}s. "
+                "E*Trade API may be slow. Try again later."
+            )
         except Exception as e:
-            return {
-                "status": "error",
-                "source": "etrade",
-                "error": f"Failed to list accounts: {e}",
-                "accounts": [],
-                "transactions": [],
-                "positions": [],
-                "balance_history": [],
-            }
+            error_msg = str(e)
+            if "401" in error_msg or "unauthorized" in error_msg.lower():
+                return _error_result(
+                    f"E*Trade authentication failed (401). Tokens may be invalid. "
+                    f"{_reauth_instructions()}"
+                )
+            return _error_result(f"Failed to list accounts: {e}")
 
         raw_accounts = _ensure_list(
             acct_resp.get("AccountListResponse", {})
@@ -339,11 +411,12 @@ class EtradeScraper:
             day_change = None
             day_change_pct = None
             try:
-                bal_resp = accounts_api.get_account_balance(
-                    account_id_key=account_id_key,
-                    real_time=True,
-                    resp_format="json",
-                )
+                with api_timeout(API_TIMEOUT):
+                    bal_resp = accounts_api.get_account_balance(
+                        account_id_key=account_id_key,
+                        real_time=True,
+                        resp_format="json",
+                    )
                 bal = bal_resp.get("BalanceResponse", {})
                 computed = bal.get("Computed", {})
                 rt = computed.get("RealTimeValues", {})
@@ -351,6 +424,8 @@ class EtradeScraper:
                 # Day change from real-time values
                 day_change = float(rt.get("netMv", 0)) if rt.get("netMv") else None
                 day_change_pct = float(rt.get("netMvPct", 0)) if rt.get("netMvPct") else None
+            except ApiTimeoutError:
+                print(f"   Balance timeout for {account_name} (>{API_TIMEOUT}s)", file=sys.stderr)
             except Exception as e:
                 print(f"   Balance error for {account_name}: {e}", file=sys.stderr)
 
@@ -370,10 +445,11 @@ class EtradeScraper:
 
             # --- Get positions ---
             try:
-                port_resp = accounts_api.get_account_portfolio(
-                    account_id_key=account_id_key,
-                    resp_format="json",
-                )
+                with api_timeout(API_TIMEOUT):
+                    port_resp = accounts_api.get_account_portfolio(
+                        account_id_key=account_id_key,
+                        resp_format="json",
+                    )
                 portfolios = _ensure_list(
                     port_resp.get("PortfolioResponse", {}).get("AccountPortfolio", [])
                 )
@@ -391,11 +467,12 @@ class EtradeScraper:
                         total_gain = float(pos.get("totalGain", 0))
                         day_gain = float(pos.get("daysGain", 0))
                         price_paid = float(pos.get("pricePaid", 0))
+                        cost_basis = float(pos.get("totalCost", 0)) or (market_value - total_gain)
+                        day_gain_pct = float(pos.get("daysGainPct", 0)) if pos.get("daysGainPct") else None
 
                         quick = pos.get("Quick", {})
                         last_price = float(quick.get("lastTrade", 0))
 
-                        cost_basis = market_value - total_gain
                         total_gain_pct = (
                             (total_gain / cost_basis * 100) if cost_basis != 0 else 0.0
                         )
@@ -412,25 +489,30 @@ class EtradeScraper:
                             "quantity": quantity,
                             "last_price": last_price,
                             "price_paid": price_paid,
+                            "cost_basis": cost_basis,
                             "market_value": market_value,
                             "day_gain": day_gain,
+                            "day_gain_percent": day_gain_pct,
                             "total_gain": total_gain,
                             "total_gain_percent": total_gain_pct,
                         })
+            except ApiTimeoutError:
+                print(f"   Positions timeout for {account_name} (>{API_TIMEOUT}s)", file=sys.stderr)
             except Exception as e:
                 print(f"   Positions error for {account_name}: {e}", file=sys.stderr)
 
-            # --- Get transactions (last 30 days) ---
+            # --- Get transactions (last 180 days) ---
             try:
                 end_date = datetime.now()
-                start_date = end_date - timedelta(days=30)
-                txn_resp = accounts_api.list_transactions(
-                    account_id_key=account_id_key,
-                    start_date=start_date,
-                    end_date=end_date,
-                    count=50,
-                    resp_format="json",
-                )
+                start_date = end_date - timedelta(days=TRANSACTION_HISTORY_DAYS)
+                with api_timeout(API_TIMEOUT):
+                    txn_resp = accounts_api.list_transactions(
+                        account_id_key=account_id_key,
+                        start_date=start_date,
+                        end_date=end_date,
+                        count=200,
+                        resp_format="json",
+                    )
                 raw_txns = _ensure_list(
                     txn_resp.get("TransactionListResponse", {})
                     .get("Transaction", [])
@@ -461,6 +543,8 @@ class EtradeScraper:
                         "price": price,
                         "amount": float(txn.get("amount", 0)),
                     })
+            except ApiTimeoutError:
+                logger.debug("Transactions timeout for %s (>%ds)", account_name, API_TIMEOUT)
             except Exception as e:
                 # Transactions may not be available for all account types
                 logger.debug("Transactions error for %s: %s", account_name, e)

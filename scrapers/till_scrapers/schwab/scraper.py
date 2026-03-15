@@ -1,7 +1,8 @@
 """Charles Schwab scraper.
 
-Strategy: Login via Playwright, then use Schwab's internal APIs directly
-with the session cookies. No DOM scraping of tables — just API calls.
+Strategy: Login via Playwright, then extract accounts from DOM (API returns $0
+balances with base64 suffixes) and transactions via API interception on the
+history page. Direct API calls are attempted first for transactions.
 """
 
 import re
@@ -9,11 +10,27 @@ import sys
 import hashlib
 import json
 import os
+from pathlib import Path
 from till_scrapers.base import BaseScraper
+
+
+def _save_html(page_content: str, stage: str):
+    """Save HTML snapshot for offline debugging."""
+    try:
+        path = f"/tmp/till_schwab_{stage}.html"
+        Path(path).write_text(page_content)
+        print(f"   Saved HTML snapshot: {path}", file=sys.stderr)
+    except Exception as e:
+        print(f"   Failed to save HTML snapshot ({stage}): {e}", file=sys.stderr)
 
 
 class SchwabScraper(BaseScraper):
     LOGIN_URL = "https://client.schwab.com/Login/SignOn/CustomerCenterLogin.aspx"
+
+    # Known API base for transaction history
+    TXN_API_BASE = (
+        "https://ausgateway.schwab.com/api/is/transactionhistory"
+    )
 
     def __init__(self, headless: bool = True):
         super().__init__(headless=headless)
@@ -24,17 +41,15 @@ class SchwabScraper(BaseScraper):
         self.include_accounts = [s.strip() for s in include_str.split(",") if s.strip()] if include_str else []
 
     async def navigate_and_login(self, page, username: str, password: str):
-        # Try accounts page first — session cookies may still be valid
+        # Try accounts page first -- session cookies may still be valid
         print("   Checking for active session...", file=sys.stderr)
         try:
-            resp = await page.goto(
+            await page.goto(
                 "https://client.schwab.com/app/accounts/summary/",
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            # Wait for any redirects to settle
-            await page.wait_for_timeout(3000)
-            # Also wait for network to quiet down (redirects may chain)
+            await page.wait_for_timeout(2000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -44,15 +59,17 @@ class SchwabScraper(BaseScraper):
 
         current_url = page.url
         print(f"   Session check URL: {current_url}", file=sys.stderr)
+        _save_html(await page.content(), "session_check")
 
         # Session is valid if we stayed on the accounts page (not redirected to login)
         if "client.schwab.com/app/accounts" in current_url and "login" not in current_url.lower():
             print("   Session active, skipping login", file=sys.stderr)
             return
 
-        # Session expired — go to login page
-        print(f"   Session expired, logging in...", file=sys.stderr)
+        # Session expired -- go to login page
+        print("   Session expired, logging in...", file=sys.stderr)
         await page.goto(self.LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+        _save_html(await page.content(), "login_page")
 
         if not (username and password):
             raise Exception(
@@ -129,7 +146,7 @@ class SchwabScraper(BaseScraper):
             if "client.schwab.com/app/accounts" in page.url:
                 print("   Login successful!", file=sys.stderr)
             else:
-                print(f"   Post-login: {page.url}", file=sys.stderr)
+                print(f"   Post-login URL: {page.url}", file=sys.stderr)
                 print("   Waiting for 2FA...", file=sys.stderr)
                 await page.screenshot(path="/tmp/till_schwab_2fa.png")
                 try:
@@ -137,19 +154,24 @@ class SchwabScraper(BaseScraper):
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
                     await page.screenshot(path="/tmp/till_schwab_login.png")
-                    raise Exception(f"Login failed. URL: {page.url}")
+                    _save_html(await page.content(), "login_failed")
+                    raise Exception(
+                        f"Login failed at URL: {page.url}. "
+                        "Run `till test --source schwab --headful --pause` to re-auth."
+                    )
 
         except Exception as e:
             print(f"   Auto-login failed: {e}", file=sys.stderr)
             await page.screenshot(path="/tmp/till_schwab_login.png")
             raise
 
+        _save_html(await page.content(), "post_login")
         await page.wait_for_timeout(2000)
 
     async def extract(self, page) -> dict:
-        """Extract accounts and transactions using Schwab's internal APIs."""
+        """Extract accounts via DOM and transactions via API."""
 
-        # Step 1: Intercept API calls to discover endpoints
+        # Step 1: Set up API interception for transaction data only
         api_responses = {}
 
         async def capture_api(response):
@@ -162,38 +184,33 @@ class SchwabScraper(BaseScraper):
                     body = await response.text()
                     if body and body.strip() and body.strip()[0] in '{[':
                         api_responses[url] = json.loads(body)
-                        # Print truncated URL for debugging
                         print(f"   API [{response.status}]: {url[:100]}", file=sys.stderr)
                 except Exception:
                     pass
 
         page.on("response", capture_api)
 
-        # Step 2: Navigate to summary page to trigger account API calls
+        # Step 2: Navigate to summary page to load accounts
         print("   Loading account summary...", file=sys.stderr)
         await page.goto(
             "https://client.schwab.com/app/accounts/summary/",
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=30000,
         )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
 
         await page.screenshot(path="/tmp/till_schwab_accounts.png")
+        _save_html(await page.content(), "accounts_summary")
 
-        # Step 3: Try to get accounts from intercepted API responses
-        accounts = []
-        for url, data in api_responses.items():
-            if 'Account' in url or 'account' in url:
-                accounts_from_api = self._parse_accounts_from_api(data)
-                if accounts_from_api:
-                    accounts.extend(accounts_from_api)
+        # Step 3: Extract accounts from DOM (API returns $0 balances with base64 suffixes)
+        accounts = await self._extract_accounts_dom(page)
 
-        # Fallback: DOM extraction if API interception didn't find accounts with balances
-        if not accounts or all(a['balance'] == 0 for a in accounts):
-            print("   API didn't return account balances, falling back to DOM", file=sys.stderr)
-            dom_accounts = await self._extract_accounts_dom(page)
-            if dom_accounts:
-                accounts = dom_accounts
+        if not accounts:
+            print(
+                "   No accounts found in DOM. URL: " + page.url + ". "
+                "Run `till test --source schwab --headful --pause` to re-auth.",
+                file=sys.stderr,
+            )
 
         # Filter by include_accounts (match suffix OR name substring)
         if self.include_accounts:
@@ -209,16 +226,11 @@ class SchwabScraper(BaseScraper):
 
         print(f"   Found {len(accounts)} accounts", file=sys.stderr)
 
-        # Step 4: Get transactions via API or CSV download
+        # Step 4: Get transactions via direct API call, then interception fallback
         transactions = []
         if self.transaction_account:
-            # Navigate to transaction history to trigger API calls
             api_responses.clear()
             transactions = await self._extract_transactions_api(page, api_responses)
-
-            if not transactions:
-                # Try CSV download as fallback
-                transactions = await self._download_transactions_csv(page)
 
         print(f"   Found {len(transactions)} transactions", file=sys.stderr)
 
@@ -258,76 +270,8 @@ class SchwabScraper(BaseScraper):
             "balance_history": [],
         }
 
-    def _parse_accounts_from_api(self, data) -> list[dict]:
-        """Parse accounts from Schwab's internal API response."""
-        accounts = []
-
-        # Handle different API response shapes
-        items = []
-        if isinstance(data, list):
-            items = data
-        elif isinstance(data, dict):
-            # Look for account arrays in common keys
-            for key in ['Accounts', 'accounts', 'AccountList', 'Items', 'items']:
-                if key in data and isinstance(data[key], list):
-                    items = data[key]
-                    break
-            # Check nested structures
-            if not items:
-                for val in data.values():
-                    if isinstance(val, list) and len(val) > 0:
-                        if isinstance(val[0], dict) and any(
-                            k in val[0] for k in ['AccountNumber', 'accountNumber', 'AccountId', 'Balance', 'balance']
-                        ):
-                            items = val
-                            break
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-
-            name = (
-                item.get('AccountName') or item.get('accountName') or
-                item.get('DisplayName') or item.get('displayName') or
-                item.get('Description') or item.get('NickName') or ''
-            )
-            balance = (
-                item.get('AccountValue') or item.get('accountValue') or
-                item.get('Balance') or item.get('balance') or
-                item.get('TotalValue') or item.get('NetValue') or 0
-            )
-            acct_num = (
-                item.get('AccountNumber') or item.get('accountNumber') or
-                item.get('AccountId') or item.get('accountId') or ''
-            )
-
-            if isinstance(balance, str):
-                try:
-                    balance = float(balance.replace(',', '').replace('$', ''))
-                except ValueError:
-                    balance = 0
-
-            suffix = str(acct_num)[-3:] if acct_num else ""
-
-            acct_type = self._infer_type(
-                item.get('AccountType', '') or item.get('accountType', '') or name
-            )
-
-            if name:
-                print(f"   API: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
-                accounts.append({
-                    "name": name,
-                    "balance": float(balance) if balance else 0.0,
-                    "type": acct_type,
-                    "account_suffix": suffix,
-                    "day_change": item.get('DayChange') or item.get('dayChange'),
-                    "day_change_percent": item.get('DayChangePercent') or item.get('dayChangePercent'),
-                })
-
-        return accounts
-
     async def _extract_accounts_dom(self, page) -> list[dict]:
-        """Fallback: extract accounts from DOM."""
+        """Extract accounts from DOM -- the reliable method for Schwab balances."""
         accounts = []
         wrapper = await page.query_selector('div.allAccountsWrapper') or page
 
@@ -392,24 +336,53 @@ class SchwabScraper(BaseScraper):
         return accounts
 
     async def _extract_transactions_api(self, page, api_responses: dict) -> list[dict]:
-        """Navigate to transaction history, select checking account, capture API data.
+        """Get transactions via direct API call first, then interception fallback.
 
         Strategy:
-        1. Go to /app/accounts/history/ (loads default account's transactions)
-        2. Capture any API responses from the default load
-        3. Switch to the checking account via dropdown
-        4. Wait for new API responses with bank transactions
+        1. Try direct API call to ausgateway.schwab.com for the configured account
+        2. Fall back to navigating to history page and intercepting API calls
         """
         transactions = []
+        acct_id = hashlib.md5(f"schwab_{self.transaction_account}".encode()).hexdigest()[:16]
 
-        print("   Loading transaction history...", file=sys.stderr)
+        # Strategy 1: Direct API call (faster, no page navigation needed)
+        print("   Trying direct API call for transactions...", file=sys.stderr)
+        try:
+            # Schwab transaction history API -- try fetching directly with session cookies
+            api_url = (
+                f"{self.TXN_API_BASE}/v1/transactions"
+                f"?accountNumber={self.transaction_account}"
+                f"&timeFrame=Last30Days"
+            )
+            response = await page.request.get(api_url, timeout=15000)
+            if response.ok:
+                data = await response.json()
+                txns = self._parse_transactions_from_api(data)
+                if txns:
+                    print(f"   Direct API: {len(txns)} transactions", file=sys.stderr)
+                    transactions.extend(txns)
+                    # Save for debugging
+                    try:
+                        with open("/tmp/till_schwab_api_direct.json", 'w') as f:
+                            json.dump(data, f, indent=2, default=str)
+                    except Exception:
+                        pass
+                    return transactions
+            else:
+                print(f"   Direct API returned {response.status}, falling back to interception", file=sys.stderr)
+        except Exception as e:
+            print(f"   Direct API failed: {e}, falling back to interception", file=sys.stderr)
+
+        # Strategy 2: Navigate to history page and intercept API calls
+        print("   Loading transaction history page...", file=sys.stderr)
         await page.goto(
             "https://client.schwab.com/app/accounts/history/#/",
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=30000,
         )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
         await page.screenshot(path="/tmp/till_schwab_history_default.png")
+        _save_html(await page.content(), "history_default")
 
         # Capture transactions from default account load
         transactions.extend(self._collect_transactions_from_responses(api_responses))
@@ -418,12 +391,11 @@ class SchwabScraper(BaseScraper):
         if self.transaction_account:
             print(f"   Selecting account ...{self.transaction_account}...", file=sys.stderr)
 
-            # Find the account dropdown button (contains …XXX pattern)
             dropdown_btn = None
             for btn in await page.query_selector_all('button'):
                 try:
                     text = await btn.inner_text()
-                    if re.search(r'(?:…|\.\.\.)[\d-]{2,4}', text) and await btn.is_visible():
+                    if re.search(r'(?:\u2026|\.\.\.)[\d-]{2,4}', text) and await btn.is_visible():
                         dropdown_btn = btn
                         break
                 except Exception:
@@ -434,14 +406,11 @@ class SchwabScraper(BaseScraper):
                 print(f"   Dropdown shows: {btn_text[:50]}", file=sys.stderr)
 
                 if self.transaction_account not in btn_text:
-                    # Need to switch accounts
                     await dropdown_btn.click()
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(1000)
 
-                    # Clear captured responses before switching
                     api_responses.clear()
 
-                    # Click the target account
                     found = False
                     for elem in await page.query_selector_all('li, a, div[role="option"]'):
                         try:
@@ -456,49 +425,43 @@ class SchwabScraper(BaseScraper):
                             continue
 
                     if found:
-                        # Wait for new API responses
-                        await page.wait_for_timeout(8000)
+                        await page.wait_for_timeout(5000)
                         await page.screenshot(path="/tmp/till_schwab_history_checking.png")
+                        _save_html(await page.content(), "history_checking")
 
-                        # Capture bank transactions
                         new_txns = self._collect_transactions_from_responses(api_responses)
                         transactions.extend(new_txns)
                     else:
-                        print(f"   Could not find ...{self.transaction_account} in dropdown", file=sys.stderr)
+                        print(
+                            f"   Could not find ...{self.transaction_account} in dropdown. "
+                            f"URL: {page.url}. "
+                            "Run `till test --source schwab --headful --pause` to debug.",
+                            file=sys.stderr,
+                        )
                 else:
                     print(f"   Already showing ...{self.transaction_account}", file=sys.stderr)
             else:
-                print("   No account dropdown found on history page", file=sys.stderr)
+                print(
+                    f"   No account dropdown found on history page. URL: {page.url}. "
+                    "Run `till test --source schwab --headful --pause` to debug.",
+                    file=sys.stderr,
+                )
 
         # Save captured API data for offline debugging
         if api_responses:
             debug_path = "/tmp/till_schwab_api_dump.json"
             try:
+                txn_data = {
+                    url: data for url, data in api_responses.items()
+                    if 'transactionhistory' in url.lower() and 'ausgateway' in url.lower()
+                }
                 with open(debug_path, 'w') as f:
-                    # Filter to transaction-related responses
-                    txn_data = {
-                        url: data for url, data in api_responses.items()
-                        if 'transactionhistory' in url.lower() and 'ausgateway' in url.lower()
-                    }
                     json.dump(txn_data, f, indent=2, default=str)
                 print(f"   Saved API dump to {debug_path}", file=sys.stderr)
             except Exception:
                 pass
 
-        if transactions:
-            return transactions
-
-        # Fallback: try DOM table
-        print("   No transactions from API, trying DOM...", file=sys.stderr)
-        try:
-            await page.wait_for_function(
-                "() => document.querySelectorAll('table tbody tr td').length > 0",
-                timeout=10000,
-            )
-            return await self._extract_transactions_dom(page)
-        except Exception:
-            print("   No table rows found", file=sys.stderr)
-            return []
+        return transactions
 
     def _collect_transactions_from_responses(self, api_responses: dict) -> list[dict]:
         """Parse all transaction API responses collected so far."""
@@ -513,7 +476,6 @@ class SchwabScraper(BaseScraper):
             # Skip config/metadata responses (only have flags/profile)
             if set(keys) <= {'flags', 'profile', 'accountSelectorData'}:
                 continue
-            # Log what we got
             print(f"   API response keys: {keys[:10]}", file=sys.stderr)
             for k in keys:
                 v = data[k]
@@ -527,7 +489,7 @@ class SchwabScraper(BaseScraper):
         return transactions
 
     def _parse_transactions_from_api(self, data) -> list[dict]:
-        """Parse transactions from Schwab's intercepted API response.
+        """Parse transactions from Schwab's API response.
 
         Schwab uses different keys for different account types:
         - brokerageTransactions: transactionDate, action, symbol, description, amount
@@ -539,7 +501,6 @@ class SchwabScraper(BaseScraper):
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            # Try all known transaction array keys
             for key in [
                 'postedTransactions', 'pendingTransactions',
                 'brokerageTransactions', 'bankTransactions',
@@ -557,7 +518,6 @@ class SchwabScraper(BaseScraper):
             if not isinstance(item, dict):
                 continue
 
-            # Handle various field naming conventions across brokerage/bank responses
             date = (
                 item.get('transactionDate') or item.get('postingDate') or
                 item.get('TransactionDate') or item.get('Date') or
@@ -569,7 +529,6 @@ class SchwabScraper(BaseScraper):
             )
 
             # Bank transactions have separate withdrawalAmount/depositAmount fields
-            # Check these FIRST before falling back to generic amount fields
             withdrawal = (
                 item.get('withdrawalAmount') or item.get('withdrawal') or
                 item.get('Withdrawal') or ''
@@ -580,17 +539,16 @@ class SchwabScraper(BaseScraper):
             )
 
             amount = None
-            if withdrawal and withdrawal.strip():
-                w = withdrawal.replace(',', '').replace('$', '').strip()
+            if withdrawal and str(withdrawal).strip():
+                w = str(withdrawal).replace(',', '').replace('$', '').strip()
                 if w:
                     amount = -abs(float(w))
-            elif deposit and deposit.strip():
-                d = deposit.replace(',', '').replace('$', '').strip()
+            elif deposit and str(deposit).strip():
+                d = str(deposit).replace(',', '').replace('$', '').strip()
                 if d:
                     amount = abs(float(d))
 
             # Fall back to generic amount fields (brokerage transactions)
-            # but NEVER use runningBalance as the amount
             if amount is None:
                 raw_amount = (
                     item.get('amount') or item.get('Amount') or
@@ -616,16 +574,7 @@ class SchwabScraper(BaseScraper):
                 full_desc = f"{full_desc} ({symbol})"
 
             if date and full_desc:
-                # Normalize date to ISO format
-                iso_date = date[:10]  # Already ISO or close to it
-                date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', date)
-                if date_match:
-                    parts = date_match.group(1).split('/')
-                    if len(parts) == 3:
-                        m, d, y = parts
-                        if len(y) == 2:
-                            y = '20' + y
-                        iso_date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+                iso_date = self._normalize_date(date)
 
                 txn_id = hashlib.md5(f"{iso_date}_{full_desc}_{amount}".encode()).hexdigest()[:16]
                 transactions.append({
@@ -640,180 +589,24 @@ class SchwabScraper(BaseScraper):
 
         return transactions
 
-    async def _extract_transactions_dom(self, page) -> list[dict]:
-        """Scrape transactions from the visible DOM table."""
-        transactions = []
-        acct_id = hashlib.md5(f"schwab_{self.transaction_account}".encode()).hexdigest()[:16]
-
-        rows = await page.query_selector_all('table tbody tr')
-        for row in rows:
-            try:
-                cells = await row.query_selector_all('td')
-                if len(cells) < 4:
-                    continue
-
-                texts = [await c.inner_text() for c in cells]
-                texts = [t.strip() for t in texts]
-
-                date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', texts[0])
-                if not date_match:
-                    continue
-
-                parts = date_match.group(1).split('/')
-                if len(parts) != 3:
-                    continue
+    @staticmethod
+    def _normalize_date(date_str: str) -> str:
+        """Normalize a date string to ISO YYYY-MM-DD format."""
+        if not date_str:
+            return ""
+        # Already ISO
+        if re.match(r'^\d{4}-\d{2}-\d{2}', date_str):
+            return date_str[:10]
+        # MM/DD/YYYY
+        date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', date_str)
+        if date_match:
+            parts = date_match.group(1).split('/')
+            if len(parts) == 3:
                 m, d, y = parts
                 if len(y) == 2:
                     y = '20' + y
-                date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-
-                # Try last column as amount (works for both brokerage and bank layouts)
-                amount = self._parse_signed_amount(texts[-1])
-                if amount is None and len(texts) >= 5:
-                    # Bank layout: withdrawal (col 4) or deposit (col 5)
-                    w = self._parse_amount(texts[-3])
-                    dep = self._parse_amount(texts[-2])
-                    if w:
-                        amount = -w
-                    elif dep:
-                        amount = dep
-
-                if amount is None or amount == 0:
-                    continue
-
-                # Description is typically col 3 (both layouts)
-                desc = texts[3] if len(texts) > 3 else texts[1]
-
-                txn_id = hashlib.md5(f"{date}_{desc}_{amount}".encode()).hexdigest()[:16]
-                transactions.append({
-                    "id": txn_id,
-                    "account_id": acct_id,
-                    "date": date,
-                    "description": desc.strip(),
-                    "amount": amount,
-                    "category": self._infer_category(desc),
-                    "status": "posted",
-                })
-            except Exception:
-                continue
-
-        return transactions
-
-    async def _download_transactions_csv(self, page) -> list[dict]:
-        """Download transactions via the export/CSV button."""
-        transactions = []
-        acct_id = hashlib.md5(f"schwab_{self.transaction_account}".encode()).hexdigest()[:16]
-
-        try:
-            # Look for download/export button on the history page
-            for selector in [
-                'button[aria-label*="export" i]',
-                'button[aria-label*="download" i]',
-                'a[aria-label*="export" i]',
-                'a[aria-label*="download" i]',
-                'button:has-text("Export")',
-                'button:has-text("Download")',
-                '[class*="download"]',
-                '[class*="export"]',
-            ]:
-                btn = await page.query_selector(selector)
-                if btn and await btn.is_visible():
-                    print(f"   Found export button: {selector}", file=sys.stderr)
-                    async with page.expect_download(timeout=30000) as dl_info:
-                        await btn.click()
-                    download = await dl_info.value
-                    csv_path = await download.path()
-                    if csv_path:
-                        from pathlib import Path
-                        content = Path(csv_path).read_text()
-                        transactions = self._parse_csv_transactions(content, acct_id)
-                        print(f"   Parsed {len(transactions)} transactions from CSV", file=sys.stderr)
-                    break
-        except Exception as e:
-            print(f"   CSV download failed: {e}", file=sys.stderr)
-
-        return transactions
-
-    def _parse_csv_transactions(self, csv_content: str, account_id: str) -> list[dict]:
-        """Parse Schwab CSV export."""
-        import csv
-        from io import StringIO
-
-        transactions = []
-        reader = csv.DictReader(StringIO(csv_content))
-
-        for row in reader:
-            date = row.get('Date', row.get('date', ''))
-            desc = row.get('Description', row.get('description', ''))
-            amount = row.get('Amount', row.get('amount', ''))
-            withdrawal = row.get('Withdrawal', row.get('withdrawal', ''))
-            deposit = row.get('Deposit', row.get('deposit', ''))
-
-            # Parse date
-            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', date)
-            if not date_match:
-                continue
-            parts = date_match.group(1).split('/')
-            if len(parts) != 3:
-                continue
-            m, d, y = parts
-            if len(y) == 2:
-                y = '20' + y
-            iso_date = f"{y}-{m.zfill(2)}-{d.zfill(2)}"
-
-            # Parse amount
-            if amount:
-                amt = self._parse_signed_amount(amount)
-            elif withdrawal:
-                w = self._parse_amount(withdrawal)
-                amt = -w if w else None
-            elif deposit:
-                amt = self._parse_amount(deposit)
-            else:
-                amt = None
-
-            if amt is None:
-                continue
-
-            txn_id = hashlib.md5(f"{iso_date}_{desc}_{amt}".encode()).hexdigest()[:16]
-            transactions.append({
-                "id": txn_id,
-                "account_id": account_id,
-                "date": iso_date,
-                "description": desc.strip(),
-                "amount": amt,
-                "category": self._infer_category(desc),
-                "status": "posted",
-            })
-
-        return transactions
-
-    @staticmethod
-    def _parse_signed_amount(text: str) -> float | None:
-        if not text or not text.strip():
-            return None
-        match = re.search(r'(-?)\$?([\d,]+\.?\d*)', text)
-        if not match:
-            return None
-        try:
-            amount = float(match.group(2).replace(',', ''))
-            if match.group(1) == '-':
-                amount = -amount
-            return amount
-        except ValueError:
-            return None
-
-    @staticmethod
-    def _parse_amount(text: str) -> float | None:
-        if not text or not text.strip():
-            return None
-        clean = re.sub(r'[^\d,.\-]', '', text)
-        if not clean or clean in ['-', '', '.']:
-            return None
-        try:
-            return abs(float(clean.replace(',', '')))
-        except ValueError:
-            return None
+                return f"{y}-{m.zfill(2)}-{d.zfill(2)}"
+        return date_str[:10]
 
     @staticmethod
     def _infer_type(text: str) -> str:
@@ -833,14 +626,14 @@ class SchwabScraper(BaseScraper):
     @staticmethod
     def _infer_type_from_columns(type_col: str, name: str) -> str:
         for line in type_col.split('\n'):
-            l = line.strip().lower()
-            if l in ['checking']:
+            ln = line.strip().lower()
+            if ln in ['checking']:
                 return "checking"
-            if l in ['savings']:
+            if ln in ['savings']:
                 return "savings"
-            if l in ['brokerage']:
+            if ln in ['brokerage']:
                 return "brokerage"
-            if l in ['ira', 'roth']:
+            if ln in ['ira', 'roth']:
                 return "ira"
         return SchwabScraper._infer_type(name)
 

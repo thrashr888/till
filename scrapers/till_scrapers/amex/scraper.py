@@ -9,8 +9,15 @@ import re
 import sys
 import hashlib
 import json
-import os
+from pathlib import Path
 from till_scrapers.base import BaseScraper
+
+
+def _mask_acct(num: str) -> str:
+    """Mask all but last 4-5 characters of an account number."""
+    if len(num) <= 5:
+        return f"...{num}"
+    return f"...{num[-5:]}"
 
 
 class AmexScraper(BaseScraper):
@@ -23,6 +30,15 @@ class AmexScraper(BaseScraper):
             print("   Enforcing headful mode for Amex (bot detection).", file=sys.stderr)
         super().__init__(headless=False)
 
+    async def _save_debug_snapshot(self, page, label: str):
+        """Save screenshot + HTML for debugging."""
+        try:
+            await page.screenshot(path=f"/tmp/till_amex_{label}.png")
+            html = await page.content()
+            Path(f"/tmp/till_amex_{label}.html").write_text(html)
+        except Exception:
+            pass
+
     async def navigate_and_login(self, page, username: str, password: str):
         # Try dashboard first — session cookies may still be valid
         print("   Checking for active session...", file=sys.stderr)
@@ -30,9 +46,9 @@ class AmexScraper(BaseScraper):
             await page.goto(
                 self.DASHBOARD_URL,
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -63,7 +79,6 @@ class AmexScraper(BaseScraper):
             await page.wait_for_timeout(2000)
 
             # Username field
-            print("   Entering username...", file=sys.stderr)
             username_field = page.locator("#eliloUserID")
             await username_field.wait_for(timeout=15000)
             await username_field.click()
@@ -72,14 +87,12 @@ class AmexScraper(BaseScraper):
             await page.wait_for_timeout(500)
 
             # Password field
-            print("   Entering password...", file=sys.stderr)
             password_field = page.locator("#eliloPassword")
             await password_field.click()
             await password_field.type(password, delay=30)
             await page.wait_for_timeout(500)
 
             # Submit
-            print("   Clicking login...", file=sys.stderr)
             await page.locator("#loginSubmit").click()
 
             # Wait for navigation after login
@@ -92,22 +105,25 @@ class AmexScraper(BaseScraper):
             if "dashboard" in page.url:
                 print("   Login successful!", file=sys.stderr)
             else:
-                print(f"   Post-login: {page.url}", file=sys.stderr)
                 print("   Waiting for 2FA...", file=sys.stderr)
-                await page.screenshot(path="/tmp/till_amex_2fa.png")
+                await self._save_debug_snapshot(page, "2fa")
                 try:
                     await page.wait_for_url("**/dashboard**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
-                    await page.screenshot(path="/tmp/till_amex_login.png")
-                    raise Exception(f"Login failed. URL: {page.url}")
+                    await self._save_debug_snapshot(page, "login_fail")
+                    raise Exception(
+                        f"Login failed. URL: {page.url}  "
+                        f"-- Try running headful with --pause"
+                    )
 
         except Exception as e:
+            await self._save_debug_snapshot(page, "login_fail")
             print(f"   Auto-login failed: {e}", file=sys.stderr)
-            await page.screenshot(path="/tmp/till_amex_login.png")
             raise
 
         await page.wait_for_timeout(2000)
+        await self._save_debug_snapshot(page, "post_login")
 
     async def extract(self, page) -> dict:
         """Extract accounts and transactions using Amex's internal APIs."""
@@ -136,11 +152,31 @@ class AmexScraper(BaseScraper):
         await page.goto(
             self.DASHBOARD_URL,
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=30000,
         )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
 
-        await page.screenshot(path="/tmp/till_amex_accounts.png")
+        # Step 2b: Try direct API calls for account data
+        print("   Trying direct API calls...", file=sys.stderr)
+        api_endpoints = [
+            "https://global.americanexpress.com/api/servicing/v1/financials/transaction_summary",
+            "https://global.americanexpress.com/api/servicing/v1/member/accounts",
+            "https://global.americanexpress.com/api/servicing/v1/financials/balances",
+        ]
+        for endpoint in api_endpoints:
+            try:
+                resp = await page.request.get(endpoint, timeout=10000)
+                if resp.status == 200:
+                    ct = resp.headers.get('content-type', '')
+                    if 'json' in ct:
+                        body = await resp.text()
+                        if body and body.strip() and body.strip()[0] in '{[':
+                            api_responses[endpoint] = json.loads(body)
+                            print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+            except Exception:
+                pass
+
+        await self._save_debug_snapshot(page, "accounts")
 
         # Step 3: Parse accounts from API responses
         accounts = []
@@ -179,10 +215,28 @@ class AmexScraper(BaseScraper):
             await page.goto(
                 "https://global.americanexpress.com/activity",
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(8000)
-            await page.screenshot(path="/tmp/till_amex_activity.png")
+            await page.wait_for_timeout(5000)
+            await self._save_debug_snapshot(page, "activity")
+
+            # Try direct API calls for transactions
+            txn_endpoints = [
+                "https://global.americanexpress.com/api/servicing/v1/financials/transactions?limit=50&status=posted",
+                "https://global.americanexpress.com/api/servicing/v1/financials/transactions?limit=50&status=pending",
+            ]
+            for endpoint in txn_endpoints:
+                try:
+                    resp = await page.request.get(endpoint, timeout=10000)
+                    if resp.status == 200:
+                        ct = resp.headers.get('content-type', '')
+                        if 'json' in ct:
+                            body = await resp.text()
+                            if body and body.strip() and body.strip()[0] in '{[':
+                                api_responses[endpoint] = json.loads(body)
+                                print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+                except Exception:
+                    pass
 
             # Parse transactions from API
             for url, data in api_responses.items():
@@ -220,7 +274,7 @@ class AmexScraper(BaseScraper):
             account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
             account_results.append({
                 "account_id": account_id,
-                "account_name": f"{acct['name']} ...{suffix}" if suffix else acct["name"],
+                "account_name": f"{acct['name']} {_mask_acct(suffix)}" if suffix else acct["name"],
                 "account_type": "credit",
                 "balance": acct["balance"],
                 "available_credit": acct.get("available_credit"),
@@ -257,7 +311,6 @@ class AmexScraper(BaseScraper):
         if isinstance(data, list):
             items = data
         elif isinstance(data, dict):
-            # Look for account arrays in common Amex API keys
             for key in [
                 'cardAccounts', 'accounts', 'cardSummary', 'cards',
                 'accountSummary', 'summaryData', 'data',
@@ -265,7 +318,6 @@ class AmexScraper(BaseScraper):
                 if key in data and isinstance(data[key], list):
                     items = data[key]
                     break
-            # Check nested structures
             if not items:
                 for val in data.values():
                     if isinstance(val, list) and len(val) > 0:
@@ -328,7 +380,7 @@ class AmexScraper(BaseScraper):
             suffix = str(acct_num).replace('-', '').replace(' ', '')[-5:] if acct_num else ""
 
             if name:
-                print(f"   API: {name} ...{suffix}: ${balance:,.2f}", file=sys.stderr)
+                print(f"   API: {name} {_mask_acct(suffix)}: ${balance:,.2f}", file=sys.stderr)
                 accounts.append({
                     "name": name,
                     "balance": float(balance) if balance else 0.0,
@@ -346,79 +398,51 @@ class AmexScraper(BaseScraper):
         accounts = []
 
         # Amex dashboard shows card tiles with balance info
-        selectors = [
-            '[data-testid*="account"]',
-            '[class*="card-chapter"]',
-            '[class*="account-summary"]',
+        for selector in [
+            '[data-testid*="account"]', '[class*="card-chapter"]',
             'section[class*="card"]',
-            '.axp-account-switcher__accountItem',
-        ]
-
-        cards = []
-        for selector in selectors:
+        ]:
             cards = await page.query_selector_all(selector)
             if cards:
                 print(f"   Found {len(cards)} card elements with: {selector}", file=sys.stderr)
-                break
+                for card in cards:
+                    try:
+                        text = await card.inner_text()
+                        lines = [l.strip() for l in text.split("\n") if l.strip()]
+                        if not lines:
+                            continue
 
-        for card in cards:
-            try:
-                text = await card.inner_text()
-                lines = [l.strip() for l in text.split("\n") if l.strip()]
-                if not lines:
-                    continue
+                        name = lines[0]
+                        balance = None
+                        available_credit = None
 
-                name = lines[0]
-                balance = None
-                available_credit = None
+                        for line in lines:
+                            if "$" in line:
+                                amount = self._parse_dollar(line)
+                                if amount is not None:
+                                    if "available" in line.lower() or "credit" in line.lower():
+                                        available_credit = amount
+                                    elif "payment" in line.lower() or "due" in line.lower():
+                                        pass  # skip payment amounts for balance
+                                    elif balance is None:
+                                        balance = amount
 
-                for line in lines:
-                    if "$" in line:
-                        amount = self._parse_dollar(line)
-                        if amount is not None:
-                            if "available" in line.lower() or "credit" in line.lower():
-                                available_credit = amount
-                            elif "payment" in line.lower() or "due" in line.lower():
-                                pass  # skip payment amounts for balance
-                            elif balance is None:
-                                balance = amount
+                        if balance is not None:
+                            suffix_match = re.search(r'[\-\s*x](\d{4,5})\b', text)
+                            suffix = suffix_match.group(1) if suffix_match else ""
 
-                if balance is not None:
-                    # Try to extract last digits from card text
-                    suffix_match = re.search(r'[\-\s*x](\d{4,5})\b', text)
-                    suffix = suffix_match.group(1) if suffix_match else ""
-
-                    print(f"   DOM: {name} ...{suffix}: ${balance:,.2f}", file=sys.stderr)
-                    accounts.append({
-                        "name": name,
-                        "balance": balance,
-                        "type": "credit",
-                        "account_suffix": suffix,
-                        "available_credit": available_credit,
-                    })
-            except Exception as e:
-                print(f"   DOM parse error: {e}", file=sys.stderr)
-
-        # Last-resort fallback: try to get any dollar amounts from the page
-        if not accounts:
-            print("   Last-resort fallback: scanning page for balances", file=sys.stderr)
-            try:
-                content = await page.content()
-                # Look for balance patterns
-                balance_matches = re.findall(
-                    r'(?:balance|total|owed)[^$]*\$?([\d,]+\.?\d*)',
-                    content, re.IGNORECASE,
-                )
-                if balance_matches:
-                    balance = float(balance_matches[0].replace(',', ''))
-                    accounts.append({
-                        "name": "American Express Card",
-                        "balance": balance,
-                        "type": "credit",
-                        "account_suffix": "",
-                    })
-            except Exception:
-                pass
+                            print(f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f}", file=sys.stderr)
+                            accounts.append({
+                                "name": name,
+                                "balance": balance,
+                                "type": "credit",
+                                "account_suffix": suffix,
+                                "available_credit": available_credit,
+                            })
+                    except Exception as e:
+                        print(f"   DOM parse error: {e}", file=sys.stderr)
+                if accounts:
+                    break
 
         return accounts
 
@@ -508,20 +532,16 @@ class AmexScraper(BaseScraper):
             id_key = f"amex_{suffix}" if suffix else accounts[0]["name"]
             default_acct_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
 
-        # Amex transaction rows
-        selectors = [
-            '[data-testid*="transaction"]',
-            '[class*="transaction-row"]',
-            '[class*="activity-row"]',
-            'tr[class*="transaction"]',
-        ]
-
-        rows = []
-        for selector in selectors:
+        # Amex transaction rows — top selectors only
+        for selector in [
+            '[data-testid*="transaction"]', 'tr[class*="transaction"]',
+        ]:
             rows = await page.query_selector_all(selector)
             if rows:
                 print(f"   Found {len(rows)} transaction rows with: {selector}", file=sys.stderr)
                 break
+        else:
+            rows = []
 
         for row in rows:
             try:

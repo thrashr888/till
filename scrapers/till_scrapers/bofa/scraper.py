@@ -9,8 +9,15 @@ import re
 import sys
 import hashlib
 import json
-import os
+from pathlib import Path
 from till_scrapers.base import BaseScraper
+
+
+def _mask_acct(num: str) -> str:
+    """Mask all but last 4 characters of an account number."""
+    if len(num) <= 4:
+        return f"...{num}"
+    return f"...{num[-4:]}"
 
 
 class BofaScraper(BaseScraper):
@@ -23,6 +30,15 @@ class BofaScraper(BaseScraper):
             print("   Enforcing headful mode for BofA (bot detection).", file=sys.stderr)
         super().__init__(headless=False)
 
+    async def _save_debug_snapshot(self, page, label: str):
+        """Save screenshot + HTML for debugging."""
+        try:
+            await page.screenshot(path=f"/tmp/till_bofa_{label}.png")
+            html = await page.content()
+            Path(f"/tmp/till_bofa_{label}.html").write_text(html)
+        except Exception:
+            pass
+
     async def navigate_and_login(self, page, username: str, password: str):
         # Try dashboard first — session cookies may still be valid
         print("   Checking for active session...", file=sys.stderr)
@@ -30,9 +46,9 @@ class BofaScraper(BaseScraper):
             await page.goto(
                 self.DASHBOARD_URL,
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -63,7 +79,6 @@ class BofaScraper(BaseScraper):
             await page.wait_for_timeout(2000)
 
             # Username field
-            print("   Entering username...", file=sys.stderr)
             username_field = page.locator("#enterID-input")
             await username_field.wait_for(timeout=15000)
             await username_field.click()
@@ -72,21 +87,15 @@ class BofaScraper(BaseScraper):
             await page.wait_for_timeout(500)
 
             # Password field
-            print("   Entering password...", file=sys.stderr)
             password_field = page.locator("#tlpvt-passcode-input")
             await password_field.click()
             await password_field.type(password, delay=30)
             await page.wait_for_timeout(500)
 
             # Submit — BofA uses a sign-in button
-            print("   Clicking sign in...", file=sys.stderr)
             submit_btn = None
             for selector in [
-                '#enterID-submitButton',
-                '#signIn',
-                'button[type="submit"]',
-                'input[type="submit"]',
-                '#enter-btn',
+                '#enterID-submitButton', '#signIn', 'button[type="submit"]',
             ]:
                 try:
                     btn = page.locator(selector)
@@ -112,22 +121,25 @@ class BofaScraper(BaseScraper):
             if "myaccounts" in page.url or "secure.bankofamerica.com" in page.url:
                 print("   Login successful!", file=sys.stderr)
             else:
-                print(f"   Post-login: {page.url}", file=sys.stderr)
                 print("   Waiting for 2FA / security challenge...", file=sys.stderr)
-                await page.screenshot(path="/tmp/till_bofa_2fa.png")
+                await self._save_debug_snapshot(page, "2fa")
                 try:
                     await page.wait_for_url("**/myaccounts/**", timeout=30000)
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
-                    await page.screenshot(path="/tmp/till_bofa_login.png")
-                    raise Exception(f"Login failed. URL: {page.url}")
+                    await self._save_debug_snapshot(page, "login_fail")
+                    raise Exception(
+                        f"Login failed. URL: {page.url}  "
+                        f"-- Try running headful with --pause"
+                    )
 
         except Exception as e:
+            await self._save_debug_snapshot(page, "login_fail")
             print(f"   Auto-login failed: {e}", file=sys.stderr)
-            await page.screenshot(path="/tmp/till_bofa_login.png")
             raise
 
         await page.wait_for_timeout(2000)
+        await self._save_debug_snapshot(page, "post_login")
 
     async def extract(self, page) -> dict:
         """Extract accounts and transactions using BofA's internal APIs."""
@@ -157,11 +169,31 @@ class BofaScraper(BaseScraper):
         await page.goto(
             self.DASHBOARD_URL,
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=30000,
         )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
 
-        await page.screenshot(path="/tmp/till_bofa_accounts.png")
+        # Step 2b: Try direct API calls for account data
+        print("   Trying direct API calls...", file=sys.stderr)
+        api_endpoints = [
+            "https://secure.bankofamerica.com/api/accounts/summary",
+            "https://secure.bankofamerica.com/myaccounts/api/accounts",
+            "https://secure.bankofamerica.com/api/v1/accounts",
+        ]
+        for endpoint in api_endpoints:
+            try:
+                resp = await page.request.get(endpoint, timeout=10000)
+                if resp.status == 200:
+                    ct = resp.headers.get('content-type', '')
+                    if 'json' in ct:
+                        body = await resp.text()
+                        if body and body.strip() and body.strip()[0] in '{[':
+                            api_responses[endpoint] = json.loads(body)
+                            print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+            except Exception:
+                pass
+
+        await self._save_debug_snapshot(page, "accounts")
 
         # Step 3: Parse accounts from API responses
         accounts = []
@@ -200,10 +232,28 @@ class BofaScraper(BaseScraper):
             await page.goto(
                 "https://secure.bankofamerica.com/myaccounts/brain/redirect.go?source=overview&target=acctDetails",
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(8000)
-            await page.screenshot(path="/tmp/till_bofa_activity.png")
+            await page.wait_for_timeout(5000)
+            await self._save_debug_snapshot(page, "activity")
+
+            # Try direct API calls for transactions
+            txn_endpoints = [
+                "https://secure.bankofamerica.com/api/transactions/recent",
+                "https://secure.bankofamerica.com/myaccounts/api/activity",
+            ]
+            for endpoint in txn_endpoints:
+                try:
+                    resp = await page.request.get(endpoint, timeout=10000)
+                    if resp.status == 200:
+                        ct = resp.headers.get('content-type', '')
+                        if 'json' in ct:
+                            body = await resp.text()
+                            if body and body.strip() and body.strip()[0] in '{[':
+                                api_responses[endpoint] = json.loads(body)
+                                print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+                except Exception:
+                    pass
 
             # Parse transactions from API
             for url, data in api_responses.items():
@@ -241,7 +291,7 @@ class BofaScraper(BaseScraper):
             account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
             account_results.append({
                 "account_id": account_id,
-                "account_name": f"{acct['name']} ...{suffix}" if suffix else acct["name"],
+                "account_name": f"{acct['name']} {_mask_acct(suffix)}" if suffix else acct["name"],
                 "account_type": acct.get("type", "other"),
                 "balance": acct["balance"],
                 "available_balance": acct.get("available_balance"),
@@ -284,7 +334,6 @@ class BofaScraper(BaseScraper):
                 if key in data and isinstance(data[key], list):
                     items = data[key]
                     break
-            # Check nested structures
             if not items:
                 for val in data.values():
                     if isinstance(val, list) and len(val) > 0:
@@ -338,7 +387,7 @@ class BofaScraper(BaseScraper):
             )
 
             if name:
-                print(f"   API: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+                print(f"   API: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
                 accounts.append({
                     "name": name,
                     "balance": float(balance) if balance else 0.0,
@@ -355,21 +404,9 @@ class BofaScraper(BaseScraper):
 
         # BofA groups accounts by type: checking, savings, credit cards
         account_groups = {
-            "checking": [
-                '#checkingAccounts',
-                '.account-group-checking',
-                '[data-account-type="checking"]',
-            ],
-            "savings": [
-                '#savingsAccounts',
-                '.account-group-savings',
-                '[data-account-type="savings"]',
-            ],
-            "credit": [
-                '#creditCardAccounts',
-                '.account-group-credit',
-                '[data-account-type="credit"]',
-            ],
+            "checking": ['#checkingAccounts', '[data-account-type="checking"]'],
+            "savings": ['#savingsAccounts', '[data-account-type="savings"]'],
+            "credit": ['#creditCardAccounts', '[data-account-type="credit"]'],
         }
 
         # Try grouped extraction first
@@ -389,14 +426,9 @@ class BofaScraper(BaseScraper):
         # Fallback: generic account extraction
         if not accounts:
             print("   Trying generic account selectors...", file=sys.stderr)
-            generic_selectors = [
-                '.account-tile',
-                '.AccountItem',
-                '[class*="AccountItem"]',
-                '.account-info',
-                'li[class*="account"]',
-            ]
-            for selector in generic_selectors:
+            for selector in [
+                '.account-tile', '[class*="AccountItem"]', 'li[class*="account"]',
+            ]:
                 rows = await page.query_selector_all(selector)
                 if rows:
                     print(f"   Found {len(rows)} account elements with: {selector}", file=sys.stderr)
@@ -405,11 +437,6 @@ class BofaScraper(BaseScraper):
                         if acct:
                             accounts.append(acct)
                     break
-
-        # Last-resort: scan the full page for account patterns
-        if not accounts:
-            print("   Last-resort fallback: scanning full page", file=sys.stderr)
-            accounts = await self._extract_accounts_fullpage(page)
 
         return accounts
 
@@ -446,7 +473,7 @@ class BofaScraper(BaseScraper):
             if acct_type == "other":
                 acct_type = self._infer_type(text)
 
-            print(f"   DOM: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+            print(f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
             return {
                 "name": name,
                 "balance": balance,
@@ -457,37 +484,6 @@ class BofaScraper(BaseScraper):
         except Exception as e:
             print(f"   DOM parse error: {e}", file=sys.stderr)
             return None
-
-    async def _extract_accounts_fullpage(self, page) -> list[dict]:
-        """Last-resort: extract accounts by scanning the full page text."""
-        accounts = []
-        try:
-            content = await page.content()
-
-            # Look for checking/savings patterns
-            patterns = [
-                (r'(Checking)[^$]*\$?([\d,]+\.?\d*)', 'checking'),
-                (r'(Savings)[^$]*\$?([\d,]+\.?\d*)', 'savings'),
-                (r'(Credit\s*Card)[^$]*\$?([\d,]+\.?\d*)', 'credit'),
-            ]
-            for pattern, acct_type in patterns:
-                matches = re.findall(pattern, content, re.IGNORECASE)
-                for match in matches:
-                    name_text, balance_str = match
-                    try:
-                        balance = float(balance_str.replace(',', ''))
-                        if balance > 0:
-                            accounts.append({
-                                "name": f"BofA {name_text.strip()}",
-                                "balance": balance,
-                                "type": acct_type,
-                                "account_suffix": "",
-                            })
-                    except ValueError:
-                        continue
-        except Exception:
-            pass
-        return accounts
 
     def _parse_transactions_from_api(self, data, accounts: list[dict]) -> list[dict]:
         """Parse transactions from BofA's internal API response."""
@@ -582,21 +578,16 @@ class BofaScraper(BaseScraper):
             id_key = f"bofa_{suffix}" if suffix else accounts[0]["name"]
             default_acct_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
 
-        # BofA transaction table rows
-        selectors = [
-            'table.activity-table tbody tr',
-            '[class*="transaction-row"]',
-            '[class*="activity-row"]',
-            'tr[class*="trans"]',
-            '.transaction-records tr',
-        ]
-
-        rows = []
-        for selector in selectors:
+        # BofA transaction table rows — top selectors only
+        for selector in [
+            'table.activity-table tbody tr', '[class*="transaction-row"]',
+        ]:
             rows = await page.query_selector_all(selector)
             if rows:
                 print(f"   Found {len(rows)} transaction rows with: {selector}", file=sys.stderr)
                 break
+        else:
+            rows = []
 
         for row in rows:
             try:

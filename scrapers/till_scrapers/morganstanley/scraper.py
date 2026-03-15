@@ -15,7 +15,15 @@ import sys
 import hashlib
 import json
 import os
+from pathlib import Path
 from till_scrapers.base import BaseScraper
+
+
+def _mask_acct(num: str) -> str:
+    """Mask all but last 4 characters of an account number."""
+    if len(num) <= 4:
+        return f"...{num}"
+    return f"...{num[-4:]}"
 
 
 class MorganstanleyScraper(BaseScraper):
@@ -44,6 +52,15 @@ class MorganstanleyScraper(BaseScraper):
             return self.WORKPLACE_DASHBOARD_URL
         return self.DASHBOARD_URL
 
+    async def _save_debug_snapshot(self, page, label: str):
+        """Save screenshot + HTML for debugging."""
+        try:
+            await page.screenshot(path=f"/tmp/till_morganstanley_{label}.png")
+            html = await page.content()
+            Path(f"/tmp/till_morganstanley_{label}.html").write_text(html)
+        except Exception:
+            pass
+
     async def navigate_and_login(self, page, username: str, password: str):
         dashboard_url = self._get_dashboard_url()
         login_url = self._get_login_url()
@@ -54,9 +71,9 @@ class MorganstanleyScraper(BaseScraper):
             await page.goto(
                 dashboard_url,
                 wait_until="domcontentloaded",
-                timeout=60000,
+                timeout=30000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
@@ -85,32 +102,29 @@ class MorganstanleyScraper(BaseScraper):
 
         print("   Auto-filling login credentials...", file=sys.stderr)
         try:
-            # Morgan Stanley login form — try multiple selector strategies
-            # The login page may use different selectors depending on variant
-
-            # Wait for any login form to appear
+            # Username field — try most common selectors
             username_field = None
             for selector in [
                 '#username', '#userName', 'input[name="username"]',
-                'input[name="userName"]', 'input[type="text"]',
-                '#txtUserName', 'input[id*="user" i]',
+                'input[type="text"]',
             ]:
                 try:
                     loc = page.locator(selector).first
                     await loc.wait_for(timeout=3000)
                     if await loc.is_visible():
                         username_field = loc
-                        print(f"   Found username field: {selector}", file=sys.stderr)
                         break
                 except Exception:
                     continue
 
             if not username_field:
-                await page.screenshot(path="/tmp/till_morganstanley_login.png")
-                raise Exception("Could not find username field on login page")
+                await self._save_debug_snapshot(page, "login_fail")
+                raise Exception(
+                    f"Could not find username field on login page. "
+                    f"URL: {page.url}  -- Try running headful with --pause"
+                )
 
             # Enter username
-            print("   Entering username...", file=sys.stderr)
             await username_field.click()
             await username_field.fill("")
             await username_field.type(username, delay=50)
@@ -119,24 +133,20 @@ class MorganstanleyScraper(BaseScraper):
             # Find password field
             password_field = None
             for selector in [
-                '#password', '#txtPassword', 'input[name="password"]',
-                'input[type="password"]', 'input[id*="pass" i]',
+                '#password', 'input[name="password"]', 'input[type="password"]',
             ]:
                 try:
                     loc = page.locator(selector).first
                     if await loc.is_visible():
                         password_field = loc
-                        print(f"   Found password field: {selector}", file=sys.stderr)
                         break
                 except Exception:
                     continue
 
             if not password_field:
                 # Some MS login flows show password on a second step
-                print("   No password field visible, checking for next button...", file=sys.stderr)
                 for btn_sel in [
-                    'button[type="submit"]', '#btnNext', 'button:has-text("Next")',
-                    'input[type="submit"]',
+                    'button[type="submit"]', 'button:has-text("Next")',
                 ]:
                     try:
                         btn = page.locator(btn_sel).first
@@ -149,8 +159,7 @@ class MorganstanleyScraper(BaseScraper):
 
                 # Now look for password field again
                 for selector in [
-                    '#password', '#txtPassword', 'input[name="password"]',
-                    'input[type="password"]', 'input[id*="pass" i]',
+                    '#password', 'input[name="password"]', 'input[type="password"]',
                 ]:
                     try:
                         loc = page.locator(selector).first
@@ -162,22 +171,22 @@ class MorganstanleyScraper(BaseScraper):
                         continue
 
             if not password_field:
-                await page.screenshot(path="/tmp/till_morganstanley_login.png")
-                raise Exception("Could not find password field on login page")
+                await self._save_debug_snapshot(page, "login_fail")
+                raise Exception(
+                    f"Could not find password field. "
+                    f"URL: {page.url}  -- Try running headful with --pause"
+                )
 
             # Enter password
-            print("   Entering password...", file=sys.stderr)
             await password_field.click()
             await password_field.type(password, delay=30)
             await page.wait_for_timeout(500)
 
             # Click submit
-            print("   Clicking login...", file=sys.stderr)
             submitted = False
             for btn_sel in [
-                'button[type="submit"]', '#btnSubmit', '#btnLogin',
-                'button:has-text("Sign In")', 'button:has-text("Log In")',
-                'input[type="submit"]',
+                'button[type="submit"]', 'button:has-text("Sign In")',
+                'button:has-text("Log In")', 'input[type="submit"]',
             ]:
                 try:
                     btn = page.locator(btn_sel).first
@@ -189,8 +198,11 @@ class MorganstanleyScraper(BaseScraper):
                     continue
 
             if not submitted:
-                await page.screenshot(path="/tmp/till_morganstanley_login.png")
-                raise Exception("Could not find submit button")
+                await self._save_debug_snapshot(page, "login_fail")
+                raise Exception(
+                    f"Could not find submit button. "
+                    f"URL: {page.url}  -- Try running headful with --pause"
+                )
 
             print("   Waiting for login...", file=sys.stderr)
             try:
@@ -204,9 +216,8 @@ class MorganstanleyScraper(BaseScraper):
             if "signin" not in page.url.lower() and "login" not in page.url.lower():
                 print("   Login successful!", file=sys.stderr)
             else:
-                print(f"   Post-login: {page.url}", file=sys.stderr)
                 print("   Waiting for 2FA...", file=sys.stderr)
-                await page.screenshot(path="/tmp/till_morganstanley_2fa.png")
+                await self._save_debug_snapshot(page, "2fa")
                 try:
                     await page.wait_for_url(
                         lambda url: "signin" not in url.lower() and "login" not in url.lower(),
@@ -214,18 +225,23 @@ class MorganstanleyScraper(BaseScraper):
                     )
                     print("   Login successful after 2FA!", file=sys.stderr)
                 except Exception:
-                    await page.screenshot(path="/tmp/till_morganstanley_login.png")
-                    raise Exception(f"Login failed. URL: {page.url}")
+                    await self._save_debug_snapshot(page, "login_fail")
+                    raise Exception(
+                        f"Login failed (possibly 2FA timeout). "
+                        f"URL: {page.url}  -- Try running headful with --pause"
+                    )
 
         except Exception as e:
+            if "login fail" not in str(e).lower():
+                await self._save_debug_snapshot(page, "login_fail")
             print(f"   Auto-login failed: {e}", file=sys.stderr)
-            await page.screenshot(path="/tmp/till_morganstanley_login.png")
             raise
 
         await page.wait_for_timeout(2000)
+        await self._save_debug_snapshot(page, "post_login")
 
     async def extract(self, page) -> dict:
-        """Extract accounts and positions using Morgan Stanley's internal APIs."""
+        """Extract accounts, positions, and transactions using Morgan Stanley's internal APIs."""
 
         # Step 1: Intercept API calls
         api_responses = {}
@@ -253,9 +269,37 @@ class MorganstanleyScraper(BaseScraper):
         await page.goto(
             dashboard_url,
             wait_until="domcontentloaded",
-            timeout=60000,
+            timeout=30000,
         )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(5000)
+
+        # Step 2b: Try direct API calls for account data
+        print("   Trying direct API calls...", file=sys.stderr)
+        api_endpoints = [
+            "https://www.morganstanley.com/api/accounts/summary",
+            "https://www.morganstanley.com/api/portfolio/summary",
+            "https://www.morganstanley.com/gw/accounts",
+            "https://www.morganstanley.com/gw/portfolio/positions",
+        ]
+        if self.variant == "workplace":
+            api_endpoints = [
+                "https://stockplanconnect.morganstanley.com/api/myholdings",
+                "https://stockplanconnect.morganstanley.com/api/accounts/summary",
+                "https://stockplanconnect.morganstanley.com/api/portfolio",
+            ]
+
+        for endpoint in api_endpoints:
+            try:
+                resp = await page.request.get(endpoint, timeout=10000)
+                if resp.status == 200:
+                    ct = resp.headers.get('content-type', '')
+                    if 'json' in ct:
+                        body = await resp.text()
+                        if body and body.strip() and body.strip()[0] in '{[':
+                            api_responses[endpoint] = json.loads(body)
+                            print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+            except Exception:
+                pass
 
         # For personal accounts, also try the accounts overview page
         if self.variant == "personal":
@@ -265,11 +309,11 @@ class MorganstanleyScraper(BaseScraper):
                     wait_until="domcontentloaded",
                     timeout=30000,
                 )
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(3000)
             except Exception:
                 pass
 
-        await page.screenshot(path="/tmp/till_morganstanley_accounts.png")
+        await self._save_debug_snapshot(page, "accounts")
 
         # Step 3: Parse accounts from intercepted API responses
         accounts = []
@@ -310,6 +354,10 @@ class MorganstanleyScraper(BaseScraper):
         print(f"   Found {len(accounts)} accounts", file=sys.stderr)
         print(f"   Found {len(positions)} positions", file=sys.stderr)
 
+        # Step 4: Extract transactions
+        transactions = await self._extract_transactions(page, api_responses, accounts)
+        print(f"   Found {len(transactions)} transactions", file=sys.stderr)
+
         # Save API dump for debugging
         if api_responses:
             debug_path = "/tmp/till_morganstanley_api_dump.json"
@@ -328,7 +376,7 @@ class MorganstanleyScraper(BaseScraper):
             account_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
             account_results.append({
                 "account_id": account_id,
-                "account_name": f"{acct['name']} ...{suffix}" if suffix else acct["name"],
+                "account_name": f"{acct['name']} {_mask_acct(suffix)}" if suffix else acct["name"],
                 "account_type": acct.get("type", "other"),
                 "balance": acct["balance"],
                 "day_change": acct.get("day_change"),
@@ -348,14 +396,237 @@ class MorganstanleyScraper(BaseScraper):
                 "account_id": pos.get("account_id", ""),
             })
 
+        txn_results = []
+        for txn in transactions:
+            txn_results.append({
+                "txn_id": txn["id"],
+                "account_id": txn["account_id"],
+                "date": txn["date"],
+                "description": txn["description"],
+                "amount": txn["amount"],
+                "category": txn.get("category"),
+                "status": txn.get("status", "posted"),
+            })
+
         return {
             "status": "ok",
             "source": "morganstanley",
             "accounts": account_results,
-            "transactions": [],
+            "transactions": txn_results,
             "positions": position_results,
             "balance_history": [],
         }
+
+    async def _extract_transactions(self, page, api_responses: dict, accounts: list[dict]) -> list[dict]:
+        """Navigate to activity page and extract transactions."""
+        transactions = []
+
+        # Determine default account_id
+        default_acct_id = ""
+        if accounts:
+            suffix = accounts[0].get("account_suffix", "")
+            id_key = f"morganstanley_{suffix}" if suffix else accounts[0]["name"]
+            default_acct_id = hashlib.md5(id_key.encode()).hexdigest()[:16]
+
+        # Clear API responses to capture fresh ones from activity pages
+        api_responses.clear()
+
+        # Navigate to activity/transaction pages
+        activity_urls = []
+        if self.variant == "workplace":
+            activity_urls = [
+                "https://stockplanconnect.morganstanley.com/app/transactions",
+                "https://stockplanconnect.morganstanley.com/app/activity",
+            ]
+        else:
+            activity_urls = [
+                "https://www.morganstanley.com/what-we-do/wealth-management/activity",
+                "https://www.morganstanley.com/what-we-do/wealth-management/transactions",
+            ]
+
+        print("   Loading activity page...", file=sys.stderr)
+        for url in activity_urls:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(3000)
+                # If we didn't get redirected back to login, this page exists
+                if "signin" not in page.url.lower() and "login" not in page.url.lower():
+                    break
+            except Exception:
+                continue
+
+        await self._save_debug_snapshot(page, "activity")
+
+        # Try direct API calls for transactions
+        txn_api_endpoints = [
+            "https://www.morganstanley.com/api/transactions",
+            "https://www.morganstanley.com/api/activity",
+            "https://www.morganstanley.com/gw/transactions",
+        ]
+        if self.variant == "workplace":
+            txn_api_endpoints = [
+                "https://stockplanconnect.morganstanley.com/api/transactions",
+                "https://stockplanconnect.morganstanley.com/api/activity",
+            ]
+
+        for endpoint in txn_api_endpoints:
+            try:
+                resp = await page.request.get(endpoint, timeout=10000)
+                if resp.status == 200:
+                    ct = resp.headers.get('content-type', '')
+                    if 'json' in ct:
+                        body = await resp.text()
+                        if body and body.strip() and body.strip()[0] in '{[':
+                            api_responses[endpoint] = json.loads(body)
+                            print(f"   Direct API [{resp.status}]: {endpoint[:80]}", file=sys.stderr)
+            except Exception:
+                pass
+
+        # Parse transactions from API responses
+        for url, data in api_responses.items():
+            if any(k in url.lower() for k in ['transaction', 'activity', 'history']):
+                txns = self._parse_transactions_from_api(data, default_acct_id)
+                if txns:
+                    transactions.extend(txns)
+
+        # Fallback: DOM extraction
+        if not transactions:
+            print("   No transactions from API, trying DOM...", file=sys.stderr)
+            transactions = await self._extract_transactions_dom(page, default_acct_id)
+
+        return transactions
+
+    def _parse_transactions_from_api(self, data, default_acct_id: str) -> list[dict]:
+        """Parse transactions from Morgan Stanley's internal API response."""
+        transactions = []
+        items = []
+
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            for key in [
+                'transactions', 'Transactions', 'transactionList',
+                'activity', 'Activity', 'activityList',
+                'Items', 'items', 'data',
+            ]:
+                if key in data and isinstance(data[key], list) and data[key]:
+                    items = data[key]
+                    break
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            date = (
+                item.get('transactionDate') or item.get('date') or
+                item.get('tradeDate') or item.get('settleDate') or ''
+            )
+            desc = (
+                item.get('description') or item.get('transactionDescription') or
+                item.get('activityDescription') or item.get('type') or ''
+            )
+            amount = (
+                item.get('amount') or item.get('transactionAmount') or
+                item.get('netAmount') or item.get('totalAmount') or 0
+            )
+
+            if isinstance(amount, str):
+                try:
+                    amount = float(amount.replace(',', '').replace('$', ''))
+                except ValueError:
+                    amount = 0
+
+            if date and desc:
+                iso_date = self._normalize_date(date)
+                txn_id = hashlib.md5(f"{iso_date}_{desc}_{amount}".encode()).hexdigest()[:16]
+
+                status = "posted"
+                if item.get('isPending') or item.get('pending'):
+                    status = "pending"
+
+                transactions.append({
+                    "id": txn_id,
+                    "account_id": default_acct_id,
+                    "date": iso_date,
+                    "description": desc.strip(),
+                    "amount": float(amount),
+                    "category": self._infer_category(desc),
+                    "status": status,
+                })
+
+        return transactions
+
+    async def _extract_transactions_dom(self, page, default_acct_id: str) -> list[dict]:
+        """Fallback: extract transactions from the activity page DOM."""
+        transactions = []
+
+        # Try common transaction row selectors
+        rows = []
+        for selector in [
+            '[data-testid*="transaction"]', 'table tbody tr',
+        ]:
+            rows = await page.query_selector_all(selector)
+            if rows:
+                print(f"   DOM: found {len(rows)} transaction rows with {selector}", file=sys.stderr)
+                break
+
+        for row in rows:
+            try:
+                text = await row.inner_text()
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                if len(lines) < 2:
+                    continue
+
+                # Find date
+                date_match = re.search(
+                    r'(\d{1,2}/\d{1,2}/\d{2,4})|(\d{4}-\d{2}-\d{2})',
+                    text,
+                )
+                if not date_match:
+                    continue
+
+                iso_date = self._normalize_date(date_match.group(0))
+
+                # Find amount
+                amount = None
+                for line in reversed(lines):
+                    m = re.search(r'([+-])?\$?([\d,]+\.?\d*)', line)
+                    if m:
+                        val = float(m.group(2).replace(',', ''))
+                        if m.group(1) == '-':
+                            val = -val
+                        amount = val
+                        break
+
+                if amount is None:
+                    continue
+
+                # Description: first non-date, non-amount line
+                desc = ""
+                for line in lines:
+                    if line == date_match.group(0) or "$" in line:
+                        continue
+                    if len(line) > 3:
+                        desc = line
+                        break
+
+                if not desc:
+                    desc = lines[1] if len(lines) > 1 else "Unknown"
+
+                txn_id = hashlib.md5(f"{iso_date}_{desc}_{amount}".encode()).hexdigest()[:16]
+                transactions.append({
+                    "id": txn_id,
+                    "account_id": default_acct_id,
+                    "date": iso_date,
+                    "description": desc.strip(),
+                    "amount": float(amount),
+                    "category": self._infer_category(desc),
+                    "status": "posted",
+                })
+            except Exception:
+                continue
+
+        return transactions
 
     def _parse_accounts_from_api(self, data) -> list[dict]:
         """Parse accounts from Morgan Stanley's internal API response."""
@@ -366,7 +637,7 @@ class MorganstanleyScraper(BaseScraper):
             items = data
         elif isinstance(data, dict):
             for key in [
-                'Accounts', 'accounts', 'accountList', 'AccountList',
+                'Accounts', 'accounts', 'accountList',
                 'portfolioSummary', 'summary', 'accountSummary',
                 'Items', 'items', 'data',
             ]:
@@ -421,7 +692,7 @@ class MorganstanleyScraper(BaseScraper):
             )
 
             if name:
-                print(f"   API: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+                print(f"   API: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
                 accounts.append({
                     "name": name,
                     "balance": float(balance) if balance else 0.0,
@@ -441,7 +712,7 @@ class MorganstanleyScraper(BaseScraper):
         if isinstance(data, dict):
             for key in [
                 'positions', 'Positions', 'holdings', 'Holdings',
-                'positionList', 'PositionList', 'securities', 'Securities',
+                'positionList', 'securities',
             ]:
                 if key in data and isinstance(data[key], list):
                     items = data[key]
@@ -502,12 +773,7 @@ class MorganstanleyScraper(BaseScraper):
         accounts = []
 
         for selector in [
-            '[data-testid*="account"]',
-            '.account-row',
-            '.account-card',
-            'div[class*="Account"]',
-            'tr[class*="account"]',
-            '.wm-account',
+            '[data-testid*="account"]', '.account-row', 'div[class*="Account"]',
         ]:
             rows = await page.query_selector_all(selector)
             if rows:
@@ -539,14 +805,8 @@ class MorganstanleyScraper(BaseScraper):
         """Fallback: extract workplace/StockPlan Connect accounts from DOM."""
         accounts = []
 
-        # StockPlan Connect typically shows holdings in a summary view
         for selector in [
-            '[data-testid*="holding"]',
-            '.holding-row',
-            '.stock-plan-summary',
-            'div[class*="Holding"]',
-            '.account-summary',
-            'tr[class*="holding"]',
+            '[data-testid*="holding"]', '.holding-row', 'div[class*="Holding"]',
         ]:
             rows = await page.query_selector_all(selector)
             if rows:
@@ -609,7 +869,7 @@ class MorganstanleyScraper(BaseScraper):
                     pass
 
         acct_type = self._infer_type(name)
-        print(f"   DOM: {name} ...{suffix}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
+        print(f"   DOM: {name} {_mask_acct(suffix)}: ${balance:,.2f} ({acct_type})", file=sys.stderr)
 
         return {
             "name": name,
@@ -619,6 +879,31 @@ class MorganstanleyScraper(BaseScraper):
             "day_change": None,
             "day_change_percent": None,
         }
+
+    @staticmethod
+    def _normalize_date(date_str: str) -> str:
+        """Normalize various date formats to ISO (YYYY-MM-DD)."""
+        if re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+            return date_str[:10]
+
+        m = re.search(r'(\d{1,2})/(\d{1,2})/(\d{2,4})', date_str)
+        if m:
+            month, day, year = m.group(1), m.group(2), m.group(3)
+            if len(year) == 2:
+                year = '20' + year
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+
+        import calendar
+        month_abbrs = {v.lower(): f"{i:02d}" for i, v in enumerate(calendar.month_abbr) if v}
+        m = re.search(r'(\w{3})\s+(\d{1,2}),?\s*(\d{4})?', date_str)
+        if m:
+            month_str = m.group(1).lower()
+            day = m.group(2)
+            year = m.group(3) or "2026"
+            month_num = month_abbrs.get(month_str, "01")
+            return f"{year}-{month_num}-{day.zfill(2)}"
+
+        return date_str
 
     @staticmethod
     def _infer_type(text: str) -> str:
@@ -636,3 +921,23 @@ class MorganstanleyScraper(BaseScraper):
         if any(w in t for w in ['brokerage', 'individual', 'joint', 'investment']):
             return "brokerage"
         return "other"
+
+    @staticmethod
+    def _infer_category(description: str) -> str:
+        """Infer transaction category from description."""
+        d = description.upper()
+        if any(w in d for w in ['DIVIDEND', 'DIV']):
+            return "Dividend"
+        if any(w in d for w in ['INTEREST', 'INT']):
+            return "Interest"
+        if any(w in d for w in ['BUY', 'PURCHASE', 'BOUGHT']):
+            return "Buy"
+        if any(w in d for w in ['SELL', 'SOLD', 'SALE']):
+            return "Sell"
+        if any(w in d for w in ['TRANSFER', 'XFER', 'WIRE']):
+            return "Transfer"
+        if any(w in d for w in ['FEE', 'COMMISSION']):
+            return "Fee"
+        if any(w in d for w in ['VEST', 'RSU', 'ESPP']):
+            return "Vesting"
+        return "Other"

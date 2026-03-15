@@ -1,8 +1,11 @@
 """Chase credit card scraper.
 
-Strategy: Login via Playwright, then use API interception (page.on("response"))
-to capture account and transaction data from Chase's internal APIs.
-Falls back to DOM/text extraction if API interception doesn't work.
+Strategy: Login via Playwright, then use direct API calls to Chase's internal
+endpoints (/svc/rr/accounts/...) with session cookies. Falls back to API
+interception and DOM extraction if direct calls fail.
+
+Supports multiple credit cards: after fetching the first card from card/list,
+checks singleCreditCardUser flag and switches accounts to fetch additional cards.
 
 Chase aggressively detects headless browsers, so headful mode is always forced.
 """
@@ -12,14 +15,36 @@ import sys
 import hashlib
 import json
 import os
+from pathlib import Path
 from till_scrapers.base import BaseScraper
+
+
+def _save_html(page_content: str, stage: str):
+    """Save HTML snapshot for offline debugging."""
+    try:
+        path = f"/tmp/till_chase_{stage}.html"
+        Path(path).write_text(page_content)
+        print(f"   Saved HTML snapshot: {path}", file=sys.stderr)
+    except Exception as e:
+        print(f"   Failed to save HTML snapshot ({stage}): {e}", file=sys.stderr)
 
 
 class ChaseScraper(BaseScraper):
     LOGIN_URL = "https://secure.chase.com/web/auth/dashboard"
 
+    # Known Chase API endpoints
+    CARD_LIST_API = (
+        "https://secure.chase.com/svc/rr/accounts/secure/gateway/"
+        "card/list"
+    )
+    TXN_API_BASE = (
+        "https://secure.chase.com/svc/rr/accounts/secure/gateway/"
+        "credit-card/transactions/inquiry-maintenance/etu-transactions/"
+        "v4/accounts/transactions"
+    )
+
     def __init__(self, headless: bool = True):
-        # Chase always requires headful — it aggressively detects headless
+        # Chase always requires headful -- it aggressively detects headless
         if headless:
             print("   Enforcing headful mode for Chase (bot detection).", file=sys.stderr)
         super().__init__(headless=False)
@@ -38,7 +63,6 @@ class ChaseScraper(BaseScraper):
 
     async def navigate_and_login(self, page, username: str, password: str):
         """Navigate to Chase and log in if needed."""
-        # Check for active session first
         print("   Checking for active session...", file=sys.stderr)
         try:
             await page.goto(
@@ -46,20 +70,19 @@ class ChaseScraper(BaseScraper):
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
         except Exception as e:
-            print(f"   Navigation error: {e}", file=sys.stderr)
+            print(f"   Navigation error at {self.LOGIN_URL}: {e}", file=sys.stderr)
             raise
 
-        # Check if we're already logged in (dashboard loaded, not on login page)
-        current_url = page.url
+        _save_html(await page.content(), "session_check")
+
         needs_login = await self._needs_login(page)
 
         if not needs_login:
             print("   Session active, skipping login", file=sys.stderr)
             return
 
-        # Session expired — need to log in
         print("   Session expired, logging in...", file=sys.stderr)
 
         if not (username and password):
@@ -69,23 +92,21 @@ class ChaseScraper(BaseScraper):
             )
 
         await self._do_login(page, username, password)
-        await page.wait_for_timeout(3000)
+        _save_html(await page.content(), "post_login")
+        await page.wait_for_timeout(2000)
 
     async def _needs_login(self, page) -> bool:
         """Check if we're on a login page."""
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(1000)
         url = page.url
 
-        # Check URL patterns that indicate login is needed
         if any(x in url.lower() for x in ["logon", "login", "signin"]):
             return True
 
-        # Check for login iframe (Chase uses #logonbox iframe)
         iframe = await page.query_selector('iframe#logonbox')
         if iframe:
             return True
 
-        # Check for login form elements
         login_selectors = [
             '#userId-text-input-field',
             '#userId-input-field-input',
@@ -110,7 +131,6 @@ class ChaseScraper(BaseScraper):
         print("   Looking for login form...", file=sys.stderr)
 
         try:
-            # Chase may use a login iframe (#logonbox)
             iframe_handle = await page.query_selector('iframe#logonbox')
             login_frame = page
 
@@ -118,9 +138,11 @@ class ChaseScraper(BaseScraper):
                 print("   Found login iframe, switching context...", file=sys.stderr)
                 login_frame = await iframe_handle.content_frame()
                 if not login_frame:
-                    raise Exception("Could not access login iframe content")
+                    raise Exception(
+                        "Could not access login iframe content. "
+                        "Run `till test --source chase --headful --pause` to re-auth."
+                    )
 
-            # Wait for the login form to appear
             print("   Waiting for login form...", file=sys.stderr)
             try:
                 await login_frame.wait_for_selector(
@@ -129,9 +151,13 @@ class ChaseScraper(BaseScraper):
                 )
             except Exception:
                 await page.screenshot(path="/tmp/till_chase_login_form_wait.png")
-                raise
+                _save_html(await page.content(), "login_form_missing")
+                raise Exception(
+                    f"Login form not found at {page.url}. "
+                    "Run `till test --source chase --headful --pause` to re-auth."
+                )
 
-            # Fill username with human-like typing
+            # Fill username
             print("   Entering username...", file=sys.stderr)
             username_field = None
             for selector in ['#userId-text-input-field', '#userId-input-field-input', 'input[name="userId"]']:
@@ -187,7 +213,6 @@ class ChaseScraper(BaseScraper):
             await page.wait_for_timeout(500)
 
             submitted = False
-            # Try pressing Enter on password field first (more human-like)
             if password_field:
                 try:
                     await password_field.press("Enter")
@@ -197,7 +222,6 @@ class ChaseScraper(BaseScraper):
                     pass
 
             if not submitted:
-                # Click the sign-in button
                 for sel in ['#signin-button', '#signin-button-content', 'button[type="submit"]']:
                     btn = await login_frame.query_selector(sel)
                     if btn:
@@ -210,7 +234,6 @@ class ChaseScraper(BaseScraper):
                             pass
 
             if not submitted:
-                # Frame locator fallback
                 try:
                     frame_locator = page.frame_locator('iframe#logonbox')
                     await frame_locator.locator('#signin-button').click(timeout=3000)
@@ -233,35 +256,40 @@ class ChaseScraper(BaseScraper):
                 if "dashboard" in current_url.lower() or "account" in current_url.lower():
                     print("   Appears to be logged in, continuing...", file=sys.stderr)
                 elif "identity" in current_url.lower() or "verify" in current_url.lower():
-                    print("   2FA required — approve on Chase mobile app...", file=sys.stderr)
+                    print("   2FA required -- approve on Chase mobile app...", file=sys.stderr)
                     await page.screenshot(path="/tmp/till_chase_2fa.png")
+                    _save_html(await page.content(), "2fa_required")
                     raise Exception(
-                        "2FA required. Run `till test --source chase --headful --pause` to approve."
+                        f"2FA required at {current_url}. "
+                        "Run `till test --source chase --headful --pause` to approve."
                     )
                 else:
                     print(f"   Post-login URL: {current_url}", file=sys.stderr)
-                    raise Exception(f"Login may have failed. URL: {current_url}")
+                    _save_html(await page.content(), "login_unknown_state")
+                    raise Exception(
+                        f"Login may have failed at {current_url}. "
+                        "Run `till test --source chase --headful --pause` to re-auth."
+                    )
 
         except Exception as e:
             err_msg = str(e)
-            # "Frame was detached" means login succeeded but iframe was replaced — not a real error
             if "Frame was detached" in err_msg or "frame was detached" in err_msg:
                 print("   Login iframe detached (normal after submit), continuing...", file=sys.stderr)
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(2000)
                 return
             print(f"   Auto-login failed: {e}", file=sys.stderr)
             await page.screenshot(path="/tmp/till_chase_login_error.png")
             raise
 
     async def extract(self, page) -> dict:
-        """Extract accounts and transactions using API interception + DOM fallback."""
+        """Extract accounts and transactions using direct API calls + fallbacks."""
 
-        # Step 1: Set up API interception
+        # Step 1: Set up API interception as fallback
         api_responses = {}
 
         async def capture_api(response):
             url = response.url
-            if '/api/' in url or '/svc/' in url or 'api-' in url:
+            if '/svc/' in url or '/api/' in url:
                 if response.status == 200:
                     try:
                         ct = response.headers.get('content-type', '')
@@ -276,7 +304,7 @@ class ChaseScraper(BaseScraper):
 
         page.on("response", capture_api)
 
-        # Step 2: Navigate to dashboard to trigger API calls
+        # Step 2: Navigate to dashboard if not already there
         print("   Loading dashboard...", file=sys.stderr)
         current_url = page.url
         if "dashboard" not in current_url.lower():
@@ -285,22 +313,26 @@ class ChaseScraper(BaseScraper):
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
-        await page.wait_for_timeout(8000)
+        await page.wait_for_timeout(3000)
 
         await page.screenshot(path="/tmp/till_chase_dashboard.png")
-        print("   Screenshot: /tmp/till_chase_dashboard.png", file=sys.stderr)
+        _save_html(await page.content(), "dashboard")
 
-        # Step 3: Try to get accounts from intercepted API responses
-        accounts = []
-        for url, data in api_responses.items():
-            if any(k in url.lower() for k in ['account', 'card', 'credit']):
-                api_accounts = self._parse_accounts_from_api(data)
-                if api_accounts:
-                    accounts.extend(api_accounts)
+        # Step 3: Try direct API call for card/list FIRST
+        accounts = await self._fetch_accounts_direct(page)
 
-        # Step 4: Fallback to DOM/text extraction if API didn't find accounts
+        # Fallback to intercepted API responses
         if not accounts:
-            print("   API didn't return accounts, falling back to DOM/text...", file=sys.stderr)
+            print("   Direct API didn't return accounts, checking intercepted responses...", file=sys.stderr)
+            for url, data in api_responses.items():
+                if any(k in url.lower() for k in ['account', 'card', 'credit']):
+                    api_accounts = self._parse_accounts_from_api(data)
+                    if api_accounts:
+                        accounts.extend(api_accounts)
+
+        # Fallback to DOM extraction
+        if not accounts:
+            print("   No accounts from API, falling back to DOM...", file=sys.stderr)
             accounts = await self._extract_accounts_dom(page)
 
         # Filter by configured accounts if set
@@ -319,7 +351,7 @@ class ChaseScraper(BaseScraper):
 
         print(f"   Found {len(accounts)} accounts", file=sys.stderr)
 
-        # Step 5: Extract transactions for each account
+        # Step 4: Extract transactions for each account
         transactions = []
         for acct in accounts:
             api_responses.clear()
@@ -327,16 +359,6 @@ class ChaseScraper(BaseScraper):
             transactions.extend(acct_txns)
 
         print(f"   Found {len(transactions)} transactions", file=sys.stderr)
-
-        # Save API dump for debugging
-        if api_responses:
-            debug_path = "/tmp/till_chase_api_dump.json"
-            try:
-                with open(debug_path, 'w') as f:
-                    json.dump(api_responses, f, indent=2, default=str)
-                print(f"   Saved API dump to {debug_path}", file=sys.stderr)
-            except Exception:
-                pass
 
         # Build results
         account_results = []
@@ -370,36 +392,112 @@ class ChaseScraper(BaseScraper):
             "balance_history": [],
         }
 
-    # ── API parsing ──────────────────────────────────────────────────
+    # -- Direct API calls -------------------------------------------------
 
-    def _parse_accounts_from_api(self, data) -> list[dict]:
-        """Parse accounts from Chase's internal API response.
+    async def _fetch_accounts_direct(self, page) -> list[dict]:
+        """Fetch accounts via direct API calls to Chase's card/list endpoint.
 
-        Chase card/list API shape:
-        {
-            "nickname": "Prime Visa",
-            "mask": "6173",
-            "accountId": 708766523,
-            "detail": {
-                "currentBalance": 1735.15,
-                "availableCredit": 27003.17,
-                "creditLimit": 28800.0,
-                ...
-            }
-        }
+        The card/list API returns one card at a time based on the selected account.
+        If singleCreditCardUser is false, we switch accounts and fetch additional cards.
         """
         accounts = []
 
-        # Chase card/list returns a single card object (not a list)
+        print("   Trying direct card/list API...", file=sys.stderr)
+        try:
+            response = await page.request.get(self.CARD_LIST_API, timeout=15000)
+            if not response.ok:
+                print(f"   Card/list API returned {response.status}", file=sys.stderr)
+                return accounts
+
+            data = await response.json()
+
+            # Save for debugging
+            try:
+                with open("/tmp/till_chase_card_list.json", 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+            except Exception:
+                pass
+
+            card = self._parse_chase_card(data)
+            if card:
+                accounts.append(card)
+                print(f"   Direct API: {card['name']} ...{card['last4']}", file=sys.stderr)
+
+                # Check if user has multiple credit cards
+                is_single = data.get('singleCreditCardUser', True)
+                if not is_single:
+                    print("   Multi-card user detected, fetching additional cards...", file=sys.stderr)
+                    extra = await self._fetch_additional_cards(page, data, card)
+                    accounts.extend(extra)
+            else:
+                # Try parsing as a list or nested structure
+                api_accounts = self._parse_accounts_from_api(data)
+                if api_accounts:
+                    accounts.extend(api_accounts)
+
+        except Exception as e:
+            print(f"   Direct card/list API failed: {e}", file=sys.stderr)
+
+        return accounts
+
+    async def _fetch_additional_cards(self, page, first_response: dict, first_card: dict) -> list[dict]:
+        """Fetch additional credit cards by switching the selected account.
+
+        Chase's card/list API returns one card at a time. The response includes
+        account selector data that lists all available accounts.
+        """
+        additional = []
+        seen_ids = {first_card.get("chase_account_id", "")}
+
+        # Look for account list in the response
+        account_list = (
+            first_response.get('accountSelectorData', {}).get('accounts', [])
+            or first_response.get('accounts', [])
+        )
+
+        if not account_list:
+            # Try to find accounts in the dashboard page itself
+            print("   No account list in API response, trying dashboard navigation...", file=sys.stderr)
+            return additional
+
+        for acct_entry in account_list:
+            acct_id = str(acct_entry.get('accountId', '') or acct_entry.get('digitalAccountIdentifier', ''))
+            if not acct_id or acct_id in seen_ids:
+                continue
+            seen_ids.add(acct_id)
+
+            try:
+                # Fetch card/list for this specific account
+                url = f"{self.CARD_LIST_API}?digital-account-identifier={acct_id}"
+                response = await page.request.get(url, timeout=15000)
+                if not response.ok:
+                    continue
+
+                data = await response.json()
+                card = self._parse_chase_card(data)
+                if card and card.get("chase_account_id") not in seen_ids:
+                    additional.append(card)
+                    seen_ids.add(card.get("chase_account_id", ""))
+                    print(f"   Additional card: {card['name']} ...{card['last4']}", file=sys.stderr)
+
+            except Exception as e:
+                print(f"   Failed to fetch card for account {acct_id}: {e}", file=sys.stderr)
+
+        return additional
+
+    # -- API parsing ------------------------------------------------------
+
+    def _parse_accounts_from_api(self, data) -> list[dict]:
+        """Parse accounts from Chase's internal API response."""
+        accounts = []
+
         if isinstance(data, dict):
-            # Direct card object with nickname + mask + detail
             if 'nickname' in data and 'mask' in data:
                 acct = self._parse_chase_card(data)
                 if acct:
                     accounts.append(acct)
                 return accounts
 
-            # Look for nested lists
             for key in ['accounts', 'Accounts', 'accountList', 'cards', 'cardList']:
                 if key in data and isinstance(data[key], list):
                     for item in data[key]:
@@ -446,25 +544,11 @@ class ChaseScraper(BaseScraper):
         }
 
     def _parse_transactions_from_api(self, data, account_id: str) -> list[dict]:
-        """Parse transactions from Chase's internal API response.
-
-        Chase activities API shape:
-        {
-            "activities": [{
-                "transactionDate": "2026-03-14",
-                "transactionAmount": 15.16,
-                "creditDebitCode": "D",  // D=debit (charge), C=credit (payment)
-                "transactionStatusCode": "Pending" or "Posted",
-                "etuStandardTransactionTypeGroupName": "PURCHASE",
-                "merchantDetails": {"rawMerchantDetails": {...}, "enrichedMerchants": [...]},
-            }]
-        }
-        """
+        """Parse transactions from Chase's internal API response."""
         transactions = []
 
         items = data.get('activities', []) if isinstance(data, dict) else []
         if not items:
-            # Try other keys
             for key in ['transactions', 'postedTransactions', 'pendingTransactions']:
                 if isinstance(data, dict) and key in data and isinstance(data[key], list):
                     items = data[key]
@@ -499,9 +583,9 @@ class ChaseScraper(BaseScraper):
             # D=debit (charge), C=credit (payment/refund)
             credit_debit = item.get('creditDebitCode', 'D')
             if credit_debit == 'D':
-                amount = -abs(amount)  # charges negative
+                amount = -abs(amount)
             else:
-                amount = abs(amount)   # payments/credits positive
+                amount = abs(amount)
 
             status = 'pending' if item.get('transactionStatusCode', '').lower() == 'pending' else 'posted'
 
@@ -526,7 +610,7 @@ class ChaseScraper(BaseScraper):
 
     @staticmethod
     def _map_chase_category(group: str, desc: str) -> str:
-        """Map Chase category group to standard category, with description fallback."""
+        """Map Chase category group to standard category."""
         group_map = {
             'PURCHASE': 'Shopping',
             'PAYMENT': 'Payment',
@@ -541,13 +625,12 @@ class ChaseScraper(BaseScraper):
             return mapped
         return ChaseScraper._infer_category(desc)
 
-    # ── DOM / text extraction ────────────────────────────────────────
+    # -- DOM extraction (fallback) ----------------------------------------
 
     async def _extract_accounts_dom(self, page) -> list[dict]:
         """Extract credit card accounts from the dashboard via DOM/text parsing."""
         accounts = []
 
-        # Strategy 1: JavaScript to find card names with last-4 pattern
         try:
             card_data = await page.evaluate(r'''() => {
                 const cards = [];
@@ -602,7 +685,6 @@ class ChaseScraper(BaseScraper):
                 if card.get("href"):
                     acct["url"] = card["href"]
 
-                # Parse balance from section text or full page text
                 text = card.get("text", "")
                 if not text or "Current balance" not in text:
                     text = page_text
@@ -638,208 +720,65 @@ class ChaseScraper(BaseScraper):
         except Exception as e:
             print(f"   JS card detection failed: {e}", file=sys.stderr)
 
-        # Strategy 2: Text-based regex fallback
         if not accounts:
-            try:
-                page_text = await page.inner_text('body')
-
-                # Match "Card Name (...NNNN)" on its own line
-                for match in re.finditer(
-                    r'^([A-Z][\w\s]{2,40}?)\s*\((?:\.{2,3}|\u2026)(\d{4})\)',
-                    page_text,
-                    re.MULTILINE,
-                ):
-                    name = match.group(1).strip()
-                    last4 = match.group(2)
-                    if '\n' in name or len(name) > 40 or len(name) < 3:
-                        continue
-
-                    account_id = hashlib.md5(f"chase_{name}_{last4}".encode()).hexdigest()[:16]
-                    acct = {
-                        "id": account_id,
-                        "name": name,
-                        "last4": last4,
-                        "balance": 0,
-                        "available_credit": None,
-                    }
-
-                    # Parse from text after card name
-                    section = page_text[match.end():match.end() + 800]
-                    bal = re.search(r'\$([\d,]+\.\d{2})\s*\n?\s*Current balance', section)
-                    if not bal:
-                        bal = re.search(r'Current balance\s*\n?\s*\$([\d,]+\.\d{2})', section)
-                    if bal:
-                        acct["balance"] = float(bal.group(1).replace(",", ""))
-
-                    avail = re.search(r'\$([\d,]+\.\d{2})\s*\n?\s*Available credit', section)
-                    if not avail:
-                        avail = re.search(r'Available credit\s*\n?\s*\$([\d,]+\.\d{2})', section)
-                    if avail:
-                        acct["available_credit"] = float(avail.group(1).replace(",", ""))
-
-                    print(f"   Text: {name} ...{last4}: ${acct['balance']:,.2f}", file=sys.stderr)
-                    accounts.append(acct)
-
-            except Exception as e:
-                print(f"   Text extraction failed: {e}", file=sys.stderr)
-
-        # Strategy 3: CSS selector tiles
-        if not accounts:
-            print("   Trying CSS tile selectors...", file=sys.stderr)
-            for selector in [
-                'div[class*="credit-card"]',
-                'div[class*="account-tile"]',
-                'section[class*="credit"]',
-                'mds-tile',
-            ]:
-                cards = await page.query_selector_all(selector)
-                if cards:
-                    print(f"   Found {len(cards)} tiles with: {selector}", file=sys.stderr)
-                    for card in cards:
-                        try:
-                            text = await card.inner_text()
-                            acct = self._parse_account_tile(text)
-                            if acct:
-                                accounts.append(acct)
-                        except Exception as e:
-                            print(f"   Tile parse error: {e}", file=sys.stderr)
-                    break
+            print(
+                f"   No accounts found via DOM. URL: {page.url}. "
+                "Run `till test --source chase --headful --pause` to re-auth.",
+                file=sys.stderr,
+            )
 
         return accounts
 
-    def _parse_account_tile(self, text: str) -> dict | None:
-        """Parse a credit card account from tile/section text."""
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        if not lines:
-            return None
-
-        # Find the card name
-        name = None
-        skip_words = [
-            "current balance", "available credit", "credit limit", "payment due",
-            "minimum payment", "details", "view", "pay", "more", "menu",
-            "pending", "posted", "recent", "activity", "transactions",
-        ]
-        for line in lines:
-            ll = line.lower().strip()
-            if line.startswith("$") or line.replace(",", "").replace(".", "").isdigit():
-                continue
-            if ll in skip_words or len(line) < 4 or line.startswith("..."):
-                continue
-            if any(kw in ll for kw in [
-                "sapphire", "freedom", "slate", "ink", "amazon",
-                "marriott", "united", "southwest", "aarp",
-            ]):
-                name = line
-                break
-            if not name:
-                name = line
-
-        if not name:
-            name = "Chase Card"
-
-        # Last 4 digits
-        last4 = ""
-        m = re.search(r'(?:\.{2,3}|\u2026)(\d{4})', text)
-        if m:
-            last4 = m.group(1)
-
-        account_id = hashlib.md5(f"chase_{name}_{last4}".encode()).hexdigest()[:16]
-
-        acct = {
-            "id": account_id,
-            "name": name,
-            "last4": last4,
-            "balance": 0,
-            "available_credit": None,
-        }
-
-        all_text = " ".join(lines)
-
-        # Current balance
-        bal = re.search(r'\$([\d,]+\.?\d*)\s*(?:current\s+balance)', all_text, re.IGNORECASE)
-        if not bal:
-            bal = re.search(r'(?:current\s+balance)\s*\$?([\d,]+\.?\d*)', all_text, re.IGNORECASE)
-        if bal:
-            try:
-                acct["balance"] = float(bal.group(1).replace(",", ""))
-            except ValueError:
-                pass
-
-        # Available credit
-        av = re.search(r'\$([\d,]+\.?\d*)\s*(?:available\s+credit)', all_text, re.IGNORECASE)
-        if not av:
-            av = re.search(r'(?:available\s+credit)\s*\$?([\d,]+\.?\d*)', all_text, re.IGNORECASE)
-        if av:
-            try:
-                acct["available_credit"] = float(av.group(1).replace(",", ""))
-            except ValueError:
-                pass
-
-        # Only return if we found some balance data
-        if acct["balance"] or acct.get("available_credit"):
-            return acct
-
-        # Last resort: use first dollar amount
-        amounts = re.findall(r'\$([\d,]+\.?\d*)', all_text)
-        for amt in amounts:
-            try:
-                value = float(amt.replace(",", ""))
-                if 1 <= value <= 100000:
-                    acct["balance"] = value
-                    return acct
-            except ValueError:
-                continue
-
-        return None
-
-    # ── Transaction extraction ───────────────────────────────────────
+    # -- Transaction extraction -------------------------------------------
 
     async def _extract_transactions(self, page, account: dict, api_responses: dict) -> list[dict]:
-        """Extract full transaction history using direct API calls with session cookies.
-
-        Chase API: /svc/rr/accounts/secure/gateway/credit-card/transactions/
-        inquiry-maintenance/etu-transactions/v4/accounts/transactions
-        Supports record-count=200 and provides statementCycles for pagination.
-        """
+        """Extract transactions using direct API calls with session cookies."""
         transactions = []
         account_id = account["id"]
         account_name = account.get("name", "Chase Card")
         chase_acct_id = account.get("chase_account_id", "")
 
         if not chase_acct_id:
-            print(f"   No Chase account ID for {account_name}, skipping", file=sys.stderr)
+            print(
+                f"   No Chase account ID for {account_name}, skipping transactions. "
+                "This card was likely found via DOM only.",
+                file=sys.stderr,
+            )
             return transactions
 
-        base_url = (
-            "https://secure.chase.com/svc/rr/accounts/secure/gateway/credit-card/"
-            "transactions/inquiry-maintenance/etu-transactions/v4/accounts/transactions"
-        )
-
-        print(f"   Fetching transactions for {account_name} (all history)...", file=sys.stderr)
+        print(f"   Fetching transactions for {account_name}...", file=sys.stderr)
         try:
-            # First call — get current transactions + statement cycles list
             url = (
-                f"{base_url}?digital-account-identifier={chase_acct_id}"
+                f"{self.TXN_API_BASE}?digital-account-identifier={chase_acct_id}"
                 f"&provide-available-statement-indicator=true"
                 f"&record-count=200&sort-order-code=D&sort-key-code=T"
             )
             response = await page.request.get(url, timeout=30000)
             if not response.ok:
-                print(f"   Transaction API returned {response.status}", file=sys.stderr)
+                print(
+                    f"   Transaction API returned {response.status} for {account_name}. "
+                    f"URL: {url[:120]}",
+                    file=sys.stderr,
+                )
                 return transactions
 
             data = await response.json()
             txns = self._parse_transactions_from_api(data, account_id)
             transactions.extend(txns)
-            print(f"   Current cycle: {len(txns)} transactions", file=sys.stderr)
+            print(f"   Current cycle: {len(txns)} transactions for {account_name}", file=sys.stderr)
 
-            # Save for debugging
-            with open(f"/tmp/till_chase_{account_id}_txns.json", 'w') as f:
-                json.dump(data, f, indent=2, default=str)
+            try:
+                with open(f"/tmp/till_chase_{account_id}_txns.json", 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+            except Exception:
+                pass
 
         except Exception as e:
-            print(f"   Transaction API failed: {e}", file=sys.stderr)
+            print(
+                f"   Transaction API failed for {account_name}: {e}. "
+                "Run `till test --source chase --headful --pause` to re-auth.",
+                file=sys.stderr,
+            )
 
         # Check intercepted responses as fallback
         if not transactions:
@@ -848,198 +787,10 @@ class ChaseScraper(BaseScraper):
                     txns = self._parse_transactions_from_api(data, account_id)
                     transactions.extend(txns)
 
-        print(f"   Found {len(transactions)} transactions for {account_name}", file=sys.stderr)
+        print(f"   Total {len(transactions)} transactions for {account_name}", file=sys.stderr)
         return transactions
 
-    def _parse_transactions_from_text(self, page_text: str, account_id: str) -> list[dict]:
-        """Parse transactions from page text using regex patterns.
-
-        Chase shows transactions as:
-          Dec 21, 2025
-          MERCHANT NAME
-          $17.18
-        """
-        transactions = []
-        seen = set()
-        month_map = {
-            'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-            'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-            'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
-        }
-
-        lines = page_text.split('\n')
-        current_date = None
-        i = 0
-
-        while i < len(lines):
-            line = lines[i].strip()
-
-            # Check if this line is a date
-            date_match = re.match(
-                r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s*(\d{4})$',
-                line, re.IGNORECASE,
-            )
-            if date_match:
-                month = month_map[date_match.group(1).lower()]
-                day = date_match.group(2).zfill(2)
-                year = date_match.group(3)
-                current_date = f"{year}-{month}-{day}"
-                i += 1
-                continue
-
-            # Skip noise lines
-            skip_patterns = [
-                r'^(pending|transactions?|showing|activity|date|description|amount|category|balance)',
-                r'^(pay\s|see\s|chase\s|add|close|sign|log|out|security)',
-                r'^(current|available|credit\s*limit|minimum|payment\s*due)',
-                r'^(accounts?|plan|investments|benefits|explore)',
-                r'^\$?[\d,]+\.?\d*$',
-                r'^\d+$',
-                r'^[\s>]+$',
-            ]
-            if any(re.match(p, line.lower()) for p in skip_patterns) or len(line) < 3:
-                i += 1
-                continue
-
-            # This could be a merchant description — look ahead for amount
-            description = line
-            amount = None
-
-            for j in range(1, min(4, len(lines) - i)):
-                next_line = lines[i + j].strip() if i + j < len(lines) else ""
-                amount_match = re.match(r'^(-?)\$\s*([\d,]+\.?\d*)$', next_line)
-                if amount_match:
-                    sign = amount_match.group(1)
-                    amt_str = amount_match.group(2).replace(",", "")
-                    try:
-                        value = float(amt_str)
-                        # Credit card: charges negative, payments/credits positive
-                        if sign == "-":
-                            amount = abs(value)
-                        else:
-                            amount = -abs(value)
-                        if 0.01 <= abs(amount) <= 100000:
-                            break
-                        else:
-                            amount = None
-                    except ValueError:
-                        pass
-
-            if amount and current_date and description:
-                clean_desc = description
-                for noise in ['Pay over time eligible', 'Pending']:
-                    clean_desc = clean_desc.replace(noise, '').strip()
-
-                txn_key = f"{current_date}_{clean_desc}_{amount}"
-                if txn_key not in seen and len(clean_desc) > 2:
-                    seen.add(txn_key)
-                    txn_id = hashlib.md5(f"chase_{txn_key}".encode()).hexdigest()[:16]
-
-                    # Check pending context
-                    is_pending = False
-                    if i > 0:
-                        prev = '\n'.join(lines[max(0, i - 5):i]).lower()
-                        is_pending = 'pending' in prev and 'posted' not in prev
-
-                    transactions.append({
-                        "id": txn_id,
-                        "account_id": account_id,
-                        "date": current_date,
-                        "description": clean_desc[:100],
-                        "amount": amount,
-                        "category": self._infer_category(clean_desc),
-                        "status": "pending" if is_pending else "posted",
-                    })
-
-            i += 1
-
-        return transactions
-
-    def _parse_transaction_row(self, text: str, account_id: str) -> dict | None:
-        """Parse a single transaction from a DOM row's text."""
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        if not lines:
-            return None
-
-        all_text = " ".join(lines)
-
-        # Skip headers
-        if any(x in all_text.upper() for x in ["DATE", "DESCRIPTION", "AMOUNT"]):
-            if len(lines) <= 2:
-                return None
-
-        month_map = {
-            'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04',
-            'may': '05', 'jun': '06', 'jul': '07', 'aug': '08',
-            'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
-        }
-
-        # Parse date: "Mon DD, YYYY"
-        date = None
-        m = re.search(
-            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s*(\d{4})',
-            all_text, re.IGNORECASE,
-        )
-        if m:
-            month = month_map[m.group(1).lower()]
-            day = m.group(2).zfill(2)
-            year = m.group(3)
-            date = f"{year}-{month}-{day}"
-        else:
-            # Try MM/DD/YYYY
-            m2 = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', all_text)
-            if m2:
-                parts = m2.group(1).split("/")
-                if len(parts) == 3:
-                    mo, dy, yr = parts
-                    if len(yr) == 2:
-                        yr = "20" + yr
-                    date = f"{yr}-{mo.zfill(2)}-{dy.zfill(2)}"
-
-        if not date:
-            return None
-
-        # Parse amount
-        amount_match = re.search(r'(-?)\$\s*([\d,]+\.?\d*)', all_text)
-        if not amount_match:
-            return None
-        try:
-            sign = amount_match.group(1)
-            value = float(amount_match.group(2).replace(",", ""))
-            if sign == "-":
-                amount = abs(value)
-            else:
-                amount = -abs(value)
-            if not (0.01 <= abs(amount) <= 100000):
-                return None
-        except ValueError:
-            return None
-
-        # Description: remove date and amount from text
-        desc = all_text
-        desc = re.sub(
-            r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s*\d{4}',
-            '', desc, flags=re.IGNORECASE,
-        )
-        desc = re.sub(r'\d{1,2}/\d{1,2}/\d{2,4}', '', desc)
-        desc = re.sub(r'-?\$[\d,]+\.?\d*', '', desc)
-        desc = re.sub(r'\s+', ' ', desc).strip()
-
-        if not desc:
-            return None
-
-        txn_id = hashlib.md5(f"chase_{date}_{desc}_{amount}".encode()).hexdigest()[:16]
-        return {
-            "id": txn_id,
-            "account_id": account_id,
-            "date": date,
-            "description": desc[:100],
-            "amount": amount,
-            "category": self._infer_category(desc),
-            "status": "posted",
-        }
-
-    # ── Helpers ──────────────────────────────────────────────────────
+    # -- Helpers ----------------------------------------------------------
 
     @staticmethod
     def _normalize_date(date_str: str) -> str:
@@ -1047,7 +798,6 @@ class ChaseScraper(BaseScraper):
         if not date_str:
             return ""
 
-        # Already ISO-ish
         if re.match(r'^\d{4}-\d{2}-\d{2}', date_str):
             return date_str[:10]
 
@@ -1057,7 +807,6 @@ class ChaseScraper(BaseScraper):
             'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12',
         }
 
-        # "Mon DD, YYYY"
         m = re.search(
             r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s*(\d{4})',
             date_str, re.IGNORECASE,
@@ -1067,7 +816,6 @@ class ChaseScraper(BaseScraper):
             day = m.group(2).zfill(2)
             return f"{m.group(3)}-{month}-{day}"
 
-        # MM/DD/YYYY
         m2 = re.search(r'(\d{1,2})/(\d{1,2})/(\d{2,4})', date_str)
         if m2:
             mo, dy, yr = m2.group(1), m2.group(2), m2.group(3)
