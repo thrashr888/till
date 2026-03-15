@@ -114,6 +114,18 @@ enum Commands {
         #[arg(long)]
         replay: Option<String>,
     },
+    /// Explore a bank website via existing Chrome session (no login needed)
+    Explore {
+        /// URL to explore
+        #[arg(long)]
+        url: String,
+        /// Label for output files
+        #[arg(long)]
+        label: Option<String>,
+        /// Interactive multi-page capture mode
+        #[arg(long)]
+        interactive: bool,
+    },
     /// Show sync log
     Log {
         #[arg(long)]
@@ -336,6 +348,36 @@ async fn main() -> Result<()> {
                 runner::run_test(&source, headful, pause, save_html, replay.as_deref()).await?;
             let value = serde_json::to_value(&envelope)?;
             output(&mut stdout, &value, true, cli.json)?;
+        }
+
+        Commands::Explore {
+            url,
+            label,
+            interactive,
+        } => {
+            let scrapers_dir = runner::find_scrapers_dir()?;
+            let uv = which::which("uv").unwrap_or_else(|_| std::path::PathBuf::from("uv"));
+            let mut cmd = tokio::process::Command::new(&uv);
+            cmd.arg("run")
+                .arg("--directory")
+                .arg(&scrapers_dir)
+                .arg("python")
+                .arg("-m")
+                .arg("till_scrapers.explore")
+                .arg("--url")
+                .arg(&url);
+            if let Some(ref l) = label {
+                cmd.arg("--label").arg(l);
+            }
+            if interactive {
+                cmd.arg("--interactive");
+            }
+            let status = cmd.status().await?;
+            if !status.success() {
+                eprintln!(
+                    "Explore failed. Make sure Chrome is running with --remote-debugging-port=9222"
+                );
+            }
         }
 
         Commands::Log {
