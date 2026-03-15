@@ -34,7 +34,7 @@ class SchwabScraper(BaseScraper):
         if username and password:
             print("   Auto-filling login credentials...", file=sys.stderr)
             try:
-                await page.wait_for_timeout(3000)
+                await page.wait_for_timeout(1000)
 
                 # Login form is inside an iframe with title "log in form" or id "lmsIframe"
                 frame = None
@@ -54,28 +54,41 @@ class SchwabScraper(BaseScraper):
                         continue
 
                 if frame is None:
-                    # No iframe — try directly on page (some Schwab pages have inline form)
+                    # No iframe — try directly on page
                     print("   No iframe found, trying direct page login", file=sys.stderr)
-                    await page.fill('#loginIdInput', username)
-                    await page.fill('#passwordInput', password)
+                    await page.locator('#loginIdInput').click()
+                    await page.locator('#loginIdInput').fill("")
+                    await page.locator('#loginIdInput').type(username, delay=50)
+                    await page.wait_for_timeout(300)
+                    await page.locator('#passwordInput').click()
+                    await page.locator('#passwordInput').type(password, delay=30)
+                    await page.wait_for_timeout(300)
                     await page.click('#btnLogin')
                 else:
-                    # Fill username
+                    # Fill username — use type() with delay to simulate human input
                     print("   Entering username...", file=sys.stderr)
                     try:
                         username_field = frame.get_by_role("textbox", name="Login ID")
-                        await username_field.fill(username)
+                        await username_field.click()
+                        await username_field.fill("")
+                        await username_field.type(username, delay=50)
                     except Exception:
-                        await frame.locator('#loginIdInput').fill(username)
+                        login_input = frame.locator('#loginIdInput')
+                        await login_input.click()
+                        await login_input.fill("")
+                        await login_input.type(username, delay=50)
                     await page.wait_for_timeout(500)
 
                     # Fill password
                     print("   Entering password...", file=sys.stderr)
                     try:
                         password_field = frame.get_by_role("textbox", name="Password")
-                        await password_field.fill(password)
+                        await password_field.click()
+                        await password_field.type(password, delay=30)
                     except Exception:
-                        await frame.locator('#passwordInput').fill(password)
+                        pw_input = frame.locator('#passwordInput')
+                        await pw_input.click()
+                        await pw_input.type(password, delay=30)
                     await page.wait_for_timeout(500)
 
                     # Click login

@@ -24,7 +24,7 @@ pub fn get_credentials_from_op(
 
 fn op_read_field(item: &str, field: &str) -> Result<String> {
     let output = Command::new("op")
-        .args(["item", "get", item, "--fields", field])
+        .args(["item", "get", item, "--fields", field, "--reveal"])
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run `op` CLI: {e}. Is 1Password CLI installed?"))?;
 
