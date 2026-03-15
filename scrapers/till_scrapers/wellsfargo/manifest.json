@@ -4,5 +4,6 @@
   "account_types": ["checking", "savings", "brokerage"],
   "provides": ["accounts", "transactions", "balances"],
   "requires_headful": true,
+  "op_item": "Wellsfargo (pthrasher)",
   "config_schema": {}
 }

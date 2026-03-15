@@ -3,6 +3,7 @@
   "display_name": "Fidelity",
   "account_types": ["brokerage", "ira", "401k", "hsa"],
   "provides": ["accounts", "positions", "balances"],
-  "requires_headful": true,
+  "requires_headful": false,
+  "op_item": "Fidelity (thrashr888)",
   "config_schema": {}
 }

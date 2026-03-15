@@ -4,6 +4,7 @@
   "account_types": ["brokerage", "ira", "401k"],
   "provides": ["accounts", "positions", "balances"],
   "requires_headful": true,
+  "op_item": "Morganstanley messaging",
   "config_schema": {
     "variant": {
       "type": "string",
