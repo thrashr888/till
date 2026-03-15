@@ -11,10 +11,9 @@ class SchwabScraper(BaseScraper):
     LOGIN_URL = "https://client.schwab.com/app/accounts/summary/"
 
     def __init__(self, headless: bool = True):
-        # Schwab always requires headful
-        if headless:
-            print("   Enforcing headful mode for Schwab (bot detection).", file=sys.stderr)
-        super().__init__(headless=False)
+        # Respect TILL_HEADFUL env var; otherwise use config/default
+        # Note: Schwab tends to block headless browsers
+        super().__init__(headless=headless)
 
         self.transaction_account = os.environ.get("TILL_SCHWAB_TRANSACTION_ACCOUNT", "")
 
@@ -331,18 +330,39 @@ class SchwabScraper(BaseScraper):
             history_url = "https://client.schwab.com/app/accounts/history/#/"
             print(f"   Navigating to transaction history...", file=sys.stderr)
             await page.goto(history_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(5000)
+            # SPA needs extra time to render
+            await page.wait_for_timeout(8000)
+
+            # Take a screenshot to see what loaded
+            await page.screenshot(path="/tmp/till_schwab_history_pre.png")
 
             # Try to select the right account via dropdown
             if self.transaction_account:
                 await self._select_account_dropdown(page, self.transaction_account)
+                # Wait for table to re-render after account selection
+                await page.wait_for_timeout(5000)
 
-            # Wait for the Schwab table
+            # Wait for the Schwab table — click Search first to trigger loading
             try:
-                await page.wait_for_selector('table.sdps-table', timeout=15000)
+                search_btn = await page.query_selector('button:has-text("Search")')
+                if search_btn and await search_btn.is_visible():
+                    print("   Clicking Search to load transactions...", file=sys.stderr)
+                    await search_btn.click()
+                    await page.wait_for_timeout(5000)
             except Exception:
-                print("   Transaction table not found", file=sys.stderr)
+                pass
 
+            try:
+                await page.wait_for_selector('table.sdps-table', timeout=30000)
+                print("   Found transaction table", file=sys.stderr)
+            except Exception:
+                try:
+                    await page.wait_for_selector('table', timeout=10000)
+                    print("   Found generic table", file=sys.stderr)
+                except Exception:
+                    print("   Transaction table not found", file=sys.stderr)
+
+            await page.screenshot(path="/tmp/till_schwab_transactions.png")
             await page.wait_for_timeout(2000)
 
             # Scroll to load more content
@@ -388,10 +408,28 @@ class SchwabScraper(BaseScraper):
 
             print(f"   Found {len(txn_rows)} transaction rows", file=sys.stderr)
 
+            # Detect column layout from header
+            # Bank/Checking: Date | Type | Check Number | Description | Withdrawal | Deposit | Running Balance
+            # Brokerage:     Date | Transaction Type | Symbol | Description | Quantity | Price | Fees & Comm | Amount
+            header_text = ""
+            try:
+                header_row = await page.query_selector('table.sdps-table thead tr, table thead tr')
+                if header_row:
+                    header_text = (await header_row.inner_text()).upper()
+            except Exception:
+                pass
+
+            is_brokerage = 'SYMBOL' in header_text or 'QUANTITY' in header_text
+            if is_brokerage:
+                print("   Detected brokerage transaction layout", file=sys.stderr)
+            else:
+                print("   Detected bank/checking transaction layout", file=sys.stderr)
+
+            parsed = 0
             for row in txn_rows:
                 try:
                     cells = await row.query_selector_all('td')
-                    if len(cells) < 5:
+                    if len(cells) < 4:
                         continue
 
                     cell_texts = []
@@ -399,26 +437,12 @@ class SchwabScraper(BaseScraper):
                         text = await cell.inner_text()
                         cell_texts.append(text.strip())
 
-                    # Parse columns based on count
-                    if len(cell_texts) >= 7:
-                        date_str, txn_type, check_num, description, withdrawal, deposit, balance = cell_texts[:7]
-                    elif len(cell_texts) >= 5:
-                        date_str = cell_texts[0]
-                        description = cell_texts[1]
-                        withdrawal = cell_texts[2]
-                        deposit = cell_texts[3]
-                        balance = cell_texts[4]
-                        txn_type = ""
-                        check_num = ""
-                    else:
+                    # Skip header/total rows
+                    if 'DATE' in cell_texts[0].upper() or 'TOTAL' in cell_texts[0].upper():
                         continue
 
-                    # Skip header rows
-                    if 'DATE' in date_str.upper() or 'POSTED' in date_str.upper():
-                        continue
-
-                    # Parse date
-                    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', date_str)
+                    # Parse date from first column
+                    date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4})', cell_texts[0])
                     if not date_match:
                         continue
                     raw_date = date_match.group(1)
@@ -430,18 +454,35 @@ class SchwabScraper(BaseScraper):
                         year = '20' + year
                     date = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
 
-                    # Parse amounts
-                    withdrawal_amt = self._parse_amount(withdrawal)
-                    deposit_amt = self._parse_amount(deposit)
+                    if is_brokerage:
+                        # Brokerage: Date | Type | Symbol | Description | Quantity | Price | Fees | Amount
+                        description = cell_texts[3] if len(cell_texts) > 3 else cell_texts[1]
+                        # Amount is the last column
+                        amount = self._parse_signed_amount(cell_texts[-1])
+                        if amount is None:
+                            continue
+                    else:
+                        # Bank: Date | Type | Check# | Description | Withdrawal | Deposit | Balance
+                        if len(cell_texts) >= 7:
+                            description = cell_texts[3]
+                            withdrawal_amt = self._parse_amount(cell_texts[4])
+                            deposit_amt = self._parse_amount(cell_texts[5])
+                        elif len(cell_texts) >= 5:
+                            description = cell_texts[1]
+                            withdrawal_amt = self._parse_amount(cell_texts[2])
+                            deposit_amt = self._parse_amount(cell_texts[3])
+                        else:
+                            continue
 
-                    amount = 0.0
-                    if withdrawal_amt:
-                        amount = -withdrawal_amt
-                    elif deposit_amt:
-                        amount = deposit_amt
+                        if withdrawal_amt:
+                            amount = -withdrawal_amt
+                        elif deposit_amt:
+                            amount = deposit_amt
+                        else:
+                            continue
 
-                    if amount == 0.0:
-                        continue
+                    if parsed < 3:
+                        print(f"   Row: {date} | {description[:40]} | ${amount:,.2f}", file=sys.stderr)
 
                     txn_id = hashlib.md5(
                         f"{date}_{description}_{amount}".encode()
@@ -456,6 +497,7 @@ class SchwabScraper(BaseScraper):
                         "category": self._infer_category(description),
                         "status": "posted",
                     })
+                    parsed += 1
 
                 except Exception:
                     continue
@@ -468,35 +510,82 @@ class SchwabScraper(BaseScraper):
     async def _select_account_dropdown(self, page, account_suffix: str):
         """Try to select a specific account in the transaction history dropdown."""
         try:
-            dropdown_selectors = [
-                f'button:has-text("...{account_suffix}")',
-                f'button:has-text("{account_suffix}")',
-                '[class*="account-selector"] button',
-                '[aria-haspopup="listbox"]',
-            ]
+            # The account dropdown on the history page shows current account like
+            # "Paul Jenn Savings\n…337" in a styled button with a chevron
+            dropdown_btn = None
 
-            for selector in dropdown_selectors:
-                elem = await page.query_selector(selector)
-                if elem and await elem.is_visible():
-                    text = await elem.inner_text()
-                    print(f"   Found account dropdown: {text[:40]}...", file=sys.stderr)
-                    await elem.click()
-                    await page.wait_for_timeout(2000)
+            # Look for buttons that contain an account number pattern (…XXX or ...XXX)
+            buttons = await page.query_selector_all('button')
+            for btn in buttons:
+                try:
+                    text = await btn.inner_text()
+                    # Account dropdown contains ellipsis + digits pattern
+                    # Unicode ellipsis (…) or three dots (...) followed by digits
+                    if re.search(r'(?:…|\.\.\.)[\d-]{2,4}', text) and await btn.is_visible():
+                        dropdown_btn = btn
+                        break
+                except Exception:
+                    continue
 
-                    # Find and click the target account in the dropdown
-                    for tag in ['li', 'option', 'a', 'div[role="option"]']:
-                        options = await page.query_selector_all(tag)
-                        for opt in options:
-                            opt_text = await opt.inner_text()
-                            if account_suffix in opt_text and await opt.is_visible():
-                                if 'TRANSFER' not in opt_text.upper():
-                                    print(f"   Selected account: {opt_text[:60]}...", file=sys.stderr)
-                                    await opt.click()
-                                    await page.wait_for_timeout(3000)
-                                    return
+            if not dropdown_btn:
+                print(f"   No account dropdown found", file=sys.stderr)
+                return
+
+            btn_text = await dropdown_btn.inner_text()
+            print(f"   Account dropdown shows: {btn_text.strip()[:50]}", file=sys.stderr)
+
+            # Check if already showing the right account
+            if account_suffix in btn_text:
+                print(f"   Already showing account ...{account_suffix}", file=sys.stderr)
+                return
+
+            # Click to open dropdown
+            await dropdown_btn.click()
+            await page.wait_for_timeout(2000)
+
+            # Find the target account in dropdown options
+            # Look for any clickable element containing the account suffix
+            found = False
+            for selector in ['li', 'a', 'button', 'div[role="option"]', 'span']:
+                elements = await page.query_selector_all(selector)
+                for elem in elements:
+                    try:
+                        text = await elem.inner_text()
+                        if account_suffix in text and await elem.is_visible():
+                            # Skip transaction descriptions that mention the account
+                            if 'TRANSFER' in text.upper() or re.search(r'\d{2}/\d{2}/', text):
+                                continue
+                            print(f"   Selecting: {text.strip()[:60]}", file=sys.stderr)
+                            await elem.click()
+                            await page.wait_for_timeout(5000)
+                            found = True
+                            break
+                    except Exception:
+                        continue
+                if found:
                     break
+
+            if not found:
+                print(f"   Could not find account ...{account_suffix} in dropdown", file=sys.stderr)
+
         except Exception as e:
             print(f"   Could not select account dropdown: {e}", file=sys.stderr)
+
+    @staticmethod
+    def _parse_signed_amount(text: str) -> float | None:
+        """Parse a dollar amount that may have a sign, e.g. '-$0.02' or '$100.00'."""
+        if not text or not text.strip():
+            return None
+        match = re.search(r'(-?)?\$?([\d,]+\.?\d*)', text)
+        if not match:
+            return None
+        try:
+            amount = float(match.group(2).replace(',', ''))
+            if match.group(1) == '-':
+                amount = -amount
+            return amount
+        except ValueError:
+            return None
 
     @staticmethod
     def _parse_amount(text: str) -> float | None:

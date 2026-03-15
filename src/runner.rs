@@ -123,6 +123,13 @@ pub async fn run_scraper(
         cmd.env("TILL_PASSWORD", &password);
     }
 
+    // Pass browser config
+    if let Ok(config) = crate::config::load_config() {
+        if !config.browser.headless {
+            cmd.env("TILL_HEADFUL", "1");
+        }
+    }
+
     // Pass source config extras as TILL_{SOURCE}_{KEY} env vars
     pass_config_env(&mut cmd, source);
 
